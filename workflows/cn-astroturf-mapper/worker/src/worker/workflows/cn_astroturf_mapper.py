@@ -651,7 +651,10 @@ def synchronized_bursts(ratings_by_note: dict, note_handle: dict, window_ms: int
                     "count": len(window),
                     "ratio": ratio,
                     "direction": direction,
-                    "raters": {x["participantId"] for x in window},
+                    # unknown-rater rows (participantId None) still count toward the window
+                    # size/ratio, but are never attributed: excluding them here also keeps
+                    # sorted() below from crashing on None vs str
+                    "raters": {x["participantId"] for x in window if x.get("participantId")},
                 })
         cands.sort(key=lambda c: -c["count"])
         for c in cands[:max_windows_per_note]:
@@ -1517,23 +1520,25 @@ _FULL_TO_HCODE = {"HELPFUL": "H", "SOMEWHAT_HELPFUL": "S", "NOT_HELPFUL": "N"}
 _HCODE_TO_FULL = {"H": "HELPFUL", "S": "SOMEWHAT_HELPFUL", "N": "NOT_HELPFUL"}
 
 
-def _attribute_baseline_pool(pool: list, target_raters: set, pidx: dict, max_raters: int, per_rater: int) -> dict:
-    """Attribute the order-independent non-target reservoir to target-note raters only.
+def _baseline_reservoir_update(res: dict, seen: dict, key, item, cap: int, rng) -> None:
+    """V6 baseline: reservoir-sample `item` into res[key], keeping at most `cap` items,
+    uniform over ALL items seen for that key — order-independent."""
+    seen[key] = seen.get(key, 0) + 1
+    lst = res.setdefault(key, [])
+    if len(lst) < cap:
+        lst.append(item)
+    else:
+        j = rng.randrange(seen[key])
+        if j < cap:
+            lst[j] = item
 
-    `pool` is a bounded reservoir of (pid, noteId) non-target rating rows collected during
-    the stream regardless of row order (a rater's non-target rows may precede its first
-    target-note row). Returns pidx -> [noteIds], capped at `max_raters` raters and
-    `per_rater` notes each — memory- and payload-bounded."""
-    by_rater = defaultdict(list)
-    for pid, nid in pool:
-        if pid in target_raters and pid in pidx:
-            by_rater[pidx[pid]].append(nid)
-    out = {}
-    for i, nids in by_rater.items():
-        if len(out) >= max_raters:
-            break
-        out[i] = nids[:per_rater]
-    return out
+
+def _cap_raters(res: dict, max_raters: int, rng) -> dict:
+    """Keep at most `max_raters` entries (seeded random sample) so the baseline map stays
+    memory- and payload-bounded on runs with many target-note raters."""
+    if len(res) <= max_raters:
+        return res
+    return {i: res[i] for i in rng.sample(sorted(res), max_raters)}
 
 
 def _rater_pid(row: dict):
@@ -1592,13 +1597,15 @@ def _denormalize_data(data: dict) -> dict:
 async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, baseline_sample_per_rater: int = 20) -> dict:
     """Ratings + note status history restricted to target notes (streamed), plus source info per table.
 
-    While streaming, also keeps an ORDER-INDEPENDENT reservoir (bounded to
-    BASELINE_MAX_RATERS * baseline_sample_per_rater rows) of NON-target rating rows,
-    attributed after the scan to up to BASELINE_MAX_RATERS target-note raters with up to
-    `baseline_sample_per_rater` notes each (V6 baseline/null model) — a rater's non-target
-    rows may stream before its first target-note row, so order must not matter. Memory-
-    and payload-bounded. The return is compact/indexed (see _denormalize_data) so
-    multi-handle runs stay under the activity-result payload cap.
+    V6 baseline: target-note raters are known only after the first ratings pass, so a
+    SECOND streamed pass over the ratings shards reservoir-samples NON-target rows whose
+    rater is a known target-note rater — up to `baseline_sample_per_rater` notes per rater
+    and at most BASELINE_MAX_RATERS raters (seeded sample). A single-pass global pool would
+    be dominated by the ~184M non-target rows of unrelated raters and would almost never
+    capture a target rater's baseline. Pass 2 is skipped when baseline_sample_per_rater=0
+    (e.g. the baseline vector is disabled). Memory- and payload-bounded. The return is
+    compact/indexed (see _denormalize_data) so multi-handle runs stay under the
+    activity-result payload cap.
     """
     import httpx
 
@@ -1621,12 +1628,11 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
     status_rows_scanned = 0
     rng = random.Random(12345)  # deterministic baseline sampling
     target_raters_seen = set()
-    # order-independent reservoir over NON-target rows, bounded in memory (see docstring)
-    baseline_pool: list = []  # [(pid, noteId), ...]
-    baseline_pool_seen = 0
-    pool_max = BASELINE_MAX_RATERS * max(1, baseline_sample_per_rater)
+    baseline_res: dict = {}    # pidx -> [non-target noteIds] (filled in pass 2)
+    baseline_seen: dict = {}   # pidx -> count of non-target rows seen (reservoir denominator)
+    baseline_rows_scanned = 0
     async with httpx.AsyncClient(timeout=120.0) as client:
-        # ratings
+        # ratings pass 1: target-note rows + the set of raters who rated target notes
         ratings_urls = await _shard_urls(client, CN_TABLES["ratings"], ratings_diag)
         logger.info("cn source resolved: table=ratings snapshot_date=%s shards=%s complete=%s", ratings_diag.get("snapshot_date"), ratings_diag.get("shard_count"), ratings_diag.get("complete"))
         for url in ratings_urls:
@@ -1642,17 +1648,21 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
                         int(row.get("createdAtMillis") or 0),
                         _FULL_TO_HCODE.get((row.get("helpfulnessLevel") or "").upper(), ""),
                     ])
-                elif baseline_sample_per_rater > 0 and pid:
-                    # V6 baseline pool: reservoir-sample EVERY non-target row with a rater id,
-                    # regardless of stream order; attribution to target raters happens after
-                    # the scan via _attribute_baseline_pool
-                    baseline_pool_seen += 1
-                    if len(baseline_pool) < pool_max:
-                        baseline_pool.append((pid, nid))
-                    else:
-                        j = rng.randrange(baseline_pool_seen)
-                        if j < pool_max:
-                            baseline_pool[j] = (pid, nid)
+        # ratings pass 2 (V6 baseline only): re-stream the ratings shards and reservoir-sample
+        # NON-target rows of known target-note raters (see docstring — a one-pass global pool
+        # would almost never capture them on the ~184M-row table)
+        if baseline_sample_per_rater > 0 and target_raters_seen:
+            logger.info("cn V6 baseline pass: re-streaming %s ratings shards, filtering on %s target-note raters", len(ratings_urls), len(target_raters_seen))
+            for url in ratings_urls:
+                async for row in _aiter_tsv_rows(client, url):
+                    baseline_rows_scanned += 1
+                    nid = row.get("noteId")
+                    if nid in target_note_ids:
+                        continue
+                    pid = _rater_pid(row)
+                    if not pid or pid not in target_raters_seen:
+                        continue
+                    _baseline_reservoir_update(baseline_res, baseline_seen, pidx[pid], nid, baseline_sample_per_rater, rng)
         # status history
         if detect_flips:
             status_urls = await _shard_urls(client, CN_TABLES["status"], status_diag)
@@ -1666,15 +1676,14 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
                         ts = row.get("timestampMillisOfCurrentStatus") or row.get("createdAtMillis") or 0
                         status_by_note[nid].append([int(ts or 0), (status or "").upper()])
     if baseline_sample_per_rater > 0:
-        baseline_by_rater = _attribute_baseline_pool(
-            baseline_pool, target_raters_seen, pidx, BASELINE_MAX_RATERS, baseline_sample_per_rater
-        )
+        baseline_by_rater = _cap_raters(baseline_res, BASELINE_MAX_RATERS, rng)
     else:
         baseline_by_rater = {}
     ratings_source = {
         **ratings_diag,
         "rows_scanned": ratings_rows_scanned,
         "rows_kept": sum(len(v) for v in ratings_by_note.values()),
+        "baseline_rows_scanned": baseline_rows_scanned,  # rows scanned in the V6 baseline pass 2
     }
     status_source = (
         {
@@ -2114,7 +2123,12 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         target_note_ids = {n["noteId"] for n in notes}
 
         self.steps["load_ratings"] = "running"
-        data = await load_ratings_and_status(target_note_ids, p.detect_flips, p.baseline_sample_per_rater) if target_note_ids else {
+        # baseline_sample_per_rater=0 when the V6 vector is disabled: skips the second
+        # ratings pass entirely (the baseline is the only reason for it)
+        data = await load_ratings_and_status(
+            target_note_ids, p.detect_flips,
+            p.baseline_sample_per_rater if _vector_enabled(p, "baseline_null_model") else 0,
+        ) if target_note_ids else {
             "participants": [], "ratings_by_note": {}, "status_by_note": {}, "total_ratings_kept": 0,
             "baseline_by_rater": {}, "baseline_rows_kept": 0, "enrollment_ms": [],
             "ratings_source": dict(empty_source), "status_source": None,

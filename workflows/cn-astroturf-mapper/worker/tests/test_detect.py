@@ -3,7 +3,8 @@ import asyncio
 
 from worker.workflows.cn_astroturf_mapper import (
     AstroturfMapperInput,
-    _attribute_baseline_pool,
+    _baseline_reservoir_update,
+    _cap_raters,
     _denormalize_data,
     _omit_tweet_ids_from_result,
     _permute_note_labels,
@@ -504,13 +505,38 @@ def test_f7_omit_tweet_ids_also_strips_findings_notes():
     assert findings["notes"][0]["noteId"] == "n1"
 
 
-def test_f8_baseline_pool_attribution_is_order_independent_and_bounded():
-    # pool rows may arrive before the rater's first target rating — order must not matter
-    pidx = {"r0": 0, "r1": 1}
-    pool = [("r0", "b1"), ("rX", "b9"), ("r0", "b2"), ("r1", "b3"), ("r0", "b4")]
-    out = _attribute_baseline_pool(pool, {"r0", "r1"}, pidx, max_raters=400, per_rater=2)
-    assert out[0] == ["b1", "b2"]          # r0 keeps at most per_rater notes
-    assert out[1] == ["b3"]                # r1 attributed too
-    assert all(v != ["b9"] for v in out.values())  # non-target rater rX excluded
-    capped = _attribute_baseline_pool(pool, {"r0", "r1"}, pidx, max_raters=1, per_rater=20)
-    assert len(capped) == 1                # rater cap respected
+def test_f8_baseline_reservoir_is_order_independent_and_bounded():
+    # pass-2 reservoir: a rater's non-target rows are sampled uniformly regardless of the
+    # order they arrive in (they may all precede the rater's first target-note row)
+    rng = _random.Random(3)
+    res, seen = {}, {}
+    for i in range(100):  # 100 non-target rows for rater 0, arriving "before" any target row
+        _baseline_reservoir_update(res, seen, 0, f"b{i}", cap=20, rng=rng)
+    assert len(res[0]) == 20 and len(set(res[0])) == 20  # per-rater cap respected
+    assert seen[0] == 100
+    _baseline_reservoir_update(res, seen, 1, "x1", cap=20, rng=rng)
+    assert res[1] == ["x1"]
+    # rater-level cap keeps the map bounded (seeded sample)
+    big = {i: [f"n{i}"] for i in range(1000)}
+    capped = _cap_raters(big, 400, _random.Random(3))
+    assert len(capped) == 400 and set(capped) <= set(big)
+    assert _cap_raters(big, 2000, _random.Random(3)) is big  # under the cap: unchanged
+
+
+def test_f9_unknown_rater_rows_do_not_crash_or_get_attributed_in_v5():
+    # a ratings row with participantId None (missing rater column) must still count toward
+    # window size/ratio but never enter the rater sets (sorted() would crash on None vs str)
+    base = 1_700_000_000_000
+    ratings = {
+        "n1": [{"participantId": f"r{i}", "createdAtMillis": base + i * 1000, "helpfulness": "HELPFUL"} for i in range(6)]
+              + [{"participantId": None, "createdAtMillis": base + 6000, "helpfulness": "HELPFUL"}],
+        "n2": [{"participantId": f"r{i}", "createdAtMillis": base + i * 1000, "helpfulness": "HELPFUL"} for i in range(6)]
+              + [{"participantId": None, "createdAtMillis": base + 6000, "helpfulness": "HELPFUL"}],
+    }
+    note_handle = {"n1": "h1", "n2": "h2"}
+    out = synchronized_bursts(ratings, note_handle, window_ms=30_000, min_ratings=6,
+                              one_sided_ratio=0.8, min_shared_raters=5, max_rows=10)
+    assert out["summary"]["sync_groups_flagged"] == 1  # no TypeError
+    row = out["rows"][0]
+    assert row["shared_rater_count"] == 6
+    assert None not in row["shared_raters"] and all(isinstance(p, str) for p in row["shared_raters"])

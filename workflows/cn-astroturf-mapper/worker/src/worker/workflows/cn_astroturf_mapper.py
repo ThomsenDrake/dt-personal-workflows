@@ -767,26 +767,86 @@ def permutation_p_value(observed: float, null_values: list, permutations: int) -
 
 
 def _permute_note_labels(sub: dict, note_pool: list, rng) -> dict:
-    """One permutation-null draw: every rater keeps its EXACT rated-note-set size, but the
-    notes are a uniform sample WITHOUT replacement from the shared pool (a label shuffle
-    among raters). Drawing with replacement would collapse duplicates and make null sets
-    systematically sparser than observed, biasing p-values anti-conservatively."""
+    """One permutation-null draw: every rater keeps its EXACT rated-note-set size, drawing
+    k DISTINCT labels without replacement. When the pool carries popularity weights (a
+    note may appear several times), labels are drawn by weighted sampling WITHOUT
+    replacement (Efraimidis–Spirakis keys) — duplicates in the pool must never shrink a
+    null set below its observed size (that would bias p-values anti-conservatively)."""
+    labels = sorted(set(note_pool))
+    weights = None
+    if len(labels) < len(note_pool):
+        counts = defaultdict(int)
+        for n in note_pool:
+            counts[n] += 1
+        weights = [counts[l] for l in labels]
+    n_labels = len(labels)
     perm = {}
-    pool_len = len(note_pool)
     for r, notes in sub.items():
         k = len(notes)
         if k == 0:
             perm[r] = set()
-        elif k >= pool_len:
-            perm[r] = set(note_pool)
+        elif k >= n_labels:
+            perm[r] = set(labels)
+        elif weights is None:
+            perm[r] = set(rng.sample(labels, k))
         else:
-            perm[r] = set(rng.sample(note_pool, k))
+            keys = sorted(
+                ((rng.random() ** (1.0 / w) if w > 0 else 0.0, l) for l, w in zip(labels, weights)),
+                reverse=True,
+            )
+            perm[r] = {l for _, l in keys[:k]}
     return perm
 
 
 # Cap on how many times one note may enter the permutation null's label pool — reflects
 # per-note rating popularity in the null without letting one mega-note dominate it.
 NOTE_POOL_POPULARITY_CAP = 10
+
+
+def direction_permutation_null(rater_note_dir: dict, min_overlap: float, min_cluster_size: int, min_notes: int,
+                               permutations: int = 200, seed: int = 12345, max_raters: int = 1500) -> dict:
+    """V2b null for direction clusters: per permutation, shuffle helpful-only note labels
+    among the SAME raters (preserving each rater's helpful count) and not-helpful-only
+    labels separately, then apply the EXACT linkage rule of find_direction_clusters
+    (max of the two directional Jaccards >= min_overlap) — a valid null must apply the same
+    statistic to permuted data. Rater qualification matches find_direction_clusters
+    (total notes >= min_notes, including 'other'-direction notes)."""
+    rng = random.Random(seed)
+    qualifying = [r for r, ns in rater_note_dir.items() if len(ns) >= min_notes]
+    raters = qualifying if len(qualifying) <= max_raters else rng.sample(qualifying, max_raters)
+    helpful = {r: {n for n, d in rater_note_dir[r].items() if d == "helpful"} for r in raters}
+    nh = {r: {n for n, d in rater_note_dir[r].items() if d == "not_helpful"} for r in raters}
+    h_pool = _note_label_pool([(r, n) for r in raters for n in helpful[r]])
+    n_pool = _note_label_pool([(r, n) for r in raters for n in nh[r]])
+    perms = max(0, permutations)
+    null_max = []
+    for _ in range(perms):
+        h_perm = _permute_note_labels(helpful, h_pool, rng)
+        n_perm = _permute_note_labels(nh, n_pool, rng)
+        uf = _UnionFind(raters)
+        note_raters = defaultdict(list)
+        for r in raters:
+            for n in h_perm[r]:
+                note_raters[("h", n)].append(r)
+            for n in n_perm[r]:
+                note_raters[("n", n)].append(r)
+        pairs = set()
+        for rs in note_raters.values():
+            for i in range(len(rs)):
+                for j in range(i + 1, len(rs)):
+                    pairs.add((rs[i], rs[j]))
+        for a, b in pairs:
+            if _jaccard(h_perm[a], h_perm[b]) >= min_overlap or _jaccard(n_perm[a], n_perm[b]) >= min_overlap:
+                uf.union(a, b)
+        sizes = defaultdict(int)
+        for r in raters:
+            sizes[uf.find(r)] += 1
+        null_max.append(max(sizes.values(), default=0))
+    return {
+        "params": {"permutations": perms, "min_overlap": min_overlap, "min_cluster_size": min_cluster_size,
+                   "min_notes": min_notes, "raters_used": len(raters), "raters_qualifying": len(qualifying), "seed": seed},
+        "null_max_cluster_size": null_max,
+    }
 
 
 def _note_label_pool(ratings: list, cap: int = NOTE_POOL_POPULARITY_CAP) -> list:
@@ -911,10 +971,19 @@ _GROK_AUTH_SECRET_KEYS = {"user_code"}  # ggignore
 
 
 def _public_grok_auth(d: Optional[dict]) -> Optional[dict]:
-    """Result/query-safe view of grok device-login state (strips user_code/verification_url)."""
+    """Result/query-safe view of grok device-login state: strips the user_code key AND
+    sanitizes any user_code= query parameter out of verification_url (device-completion
+    URLs embed the code — it is a secret-in-transit and must never appear in the result,
+    queries, or logs). The base URL itself is public and stays."""
     if d is None:
         return None
-    return {k: v for k, v in d.items() if k not in _GROK_AUTH_SECRET_KEYS}
+    out = {k: v for k, v in d.items() if k not in _GROK_AUTH_SECRET_KEYS}
+    url = out.get("verification_url")
+    if isinstance(url, str) and "user_code=" in url:
+        base, _, qs = url.partition("?")
+        kept = [kv for kv in qs.split("&") if kv and not kv.startswith("user_code=")]
+        out["verification_url"] = base + ("?" + "&".join(kept) if kept else "")
+    return out
 
 
 def _omit_tweet_ids_from_result(targets: list, findings: dict) -> None:
@@ -1942,24 +2011,19 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
                 None if subsampled
                 else permutation_p_value(c["size"], null["null_max_cluster_size"], null["params"]["permutations"])
             )
-        # Direction clusters: p-values from a SEPARATE null built on same-direction-LABELLED
-        # note sets ("helpful:<note>" / "not_helpful:<note>"), so the null statistic matches
-        # the direction-aware clustering; attached to the EMITTED copies in v2 (shallow copies
-        # made above — attaching to the originals would never reach the output).
+        # Direction clusters: p-values from a SEPARATE null (direction_permutation_null) that
+        # applies the SAME max-of-directional-Jaccard linkage on permuted helpful/nh sets and
+        # the SAME rater qualification as find_direction_clusters; attached to the EMITTED
+        # copies in v2 (shallow copies made above — attaching to originals never reaches output).
         dir_null = None
         if v2 is not None and (v2.get("direction_clusters") or []):
-            dir_rater_notes = {
-                r: {f"{d}:{n}" for n, d in ns.items() if d in ("helpful", "not_helpful")}
-                for r, ns in rater_note_dir.items() if len(ns) >= p.min_notes_for_rater
-            }
-            if dir_rater_notes:
-                dir_null = permutation_null(
-                    dir_rater_notes,
-                    min_overlap=p.min_co_rating_overlap,
-                    min_cluster_size=p.min_cluster_size,
-                    min_notes=p.min_notes_for_rater,
-                    permutations=p.null_permutations,
-                )
+            dir_null = direction_permutation_null(
+                rater_note_dir,
+                min_overlap=p.min_co_rating_overlap,
+                min_cluster_size=p.min_cluster_size,
+                min_notes=p.min_notes_for_rater,
+                permutations=p.null_permutations,
+            )
         dir_subsampled = bool(dir_null and dir_null["params"]["raters_used"] < dir_null["params"]["raters_qualifying"])
         for c in (v2 or {}).get("direction_clusters", []):
             c["permutation_p_value"] = (

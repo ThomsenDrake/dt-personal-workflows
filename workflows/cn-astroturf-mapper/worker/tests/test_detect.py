@@ -7,6 +7,7 @@ from worker.workflows.cn_astroturf_mapper import (
     _cap_raters,
     _choose_baseline_raters,
     _denormalize_data,
+    direction_permutation_null,
     _omit_tweet_ids_from_result,
     _note_label_pool,
     _permute_note_labels,
@@ -494,9 +495,17 @@ def test_f6_public_grok_auth_strips_device_code():
     start = {"status": "pending", "verification_url": "https://x.ai/activate", "user_code": "ABCD-1234", "pid": 42}
     pub = _public_grok_auth({**start, "status": "authenticated"})
     assert "user_code" not in pub                      # the device code never leaves the run
-    assert pub["verification_url"] == "https://x.ai/activate"  # public URL stays (documented contract)
+    assert pub["verification_url"] == "https://x.ai/activate"  # public bare URL stays
     assert pub["status"] == "authenticated" and pub["pid"] == 42
     assert _public_grok_auth(None) is None
+    # device-COMPLETION urls embed the code as a query param — it must be sanitized out
+    start2 = {"status": "pending",
+              "verification_url": "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234&client_id=x",
+              "user_code": "ABCD-1234", "pid": 7}
+    pub2 = _public_grok_auth(start2)
+    assert "user_code" not in pub2
+    assert "ABCD-1234" not in pub2["verification_url"]
+    assert pub2["verification_url"] == "https://accounts.x.ai/oauth2/device?client_id=x"
 
 
 def test_f7_omit_tweet_ids_also_strips_findings_notes():
@@ -628,3 +637,32 @@ def test_l2_note_label_pool_reflects_popularity_capped():
     assert set(pool) == {"popular", "rare"}
     big = _note_label_pool([("r", "n")] * 100, cap=10)
     assert big.count("n") == 10  # capped
+
+
+def test_h1_url_code_param_sanitized_and_weighted_draw_keeps_exact_sizes():
+    # popularity pool has duplicate labels; draws must still yield k DISTINCT labels
+    rng = _random.Random(5)
+    sub = {"r1": {"n1", "n2", "n3"}, "r2": {"n1", "n2"}}
+    ratings = [("r1", n) for n in ("n1", "n2", "n3")] + [("r2", "n1"), ("r2", "n2")] + [("r9", "n1"), ("r9", "n2"), ("r9", "n3")]
+    pool = _note_label_pool(ratings, cap=10)  # n1 appears 3x, n2 3x, n3 2x
+    assert len(pool) > len(set(pool))        # duplicated labels present
+    for _ in range(50):
+        perm = _permute_note_labels(sub, pool, rng)
+        for r, notes in sub.items():
+            assert len(perm[r]) == len(notes)  # exact size despite duplicates in the pool
+            assert perm[r] <= set(pool)
+
+
+def test_m5_direction_null_matches_observed_statistic():
+    rater_note_dir = {f"r{i}": {"n1": "helpful", "n2": "helpful", "n3": "not_helpful"} for i in range(6)}
+    null = direction_permutation_null(rater_note_dir, min_overlap=0.5, min_cluster_size=3,
+                                      min_notes=3, permutations=10)
+    assert null["params"]["raters_qualifying"] == 6 and null["params"]["raters_used"] == 6
+    assert len(null["null_max_cluster_size"]) == 10
+    p = permutation_p_value(6, null["null_max_cluster_size"], 10)
+    assert 0.0 <= p <= 1.0
+    # subsampled case exposes the mismatch for the caller's null-gating
+    big = {f"r{i}": {"n1": "helpful", "n2": "helpful"} for i in range(10)}
+    null2 = direction_permutation_null(big, min_overlap=0.5, min_cluster_size=3, min_notes=2,
+                                       permutations=3, max_raters=4)
+    assert null2["params"]["raters_qualifying"] == 10 and null2["params"]["raters_used"] == 4

@@ -170,7 +170,9 @@ class CampaignAssessment(BaseModel):
 
 
 class GrokDeviceLoginInput(BaseModel):
-    user_code: str = Field(description="The device code you entered at the verification URL (echoed back to confirm you completed the grok login)")
+    # The submitted device code is used ONLY to confirm the input was provided; it is
+    # never stored in the workflow result, queries, or logs (secrets-in-transit).
+    user_code: str = Field(description="The device code you entered at the verification URL (not stored or returned anywhere)")
 
 
 # ── Small pure helpers (also used inside activities) ──────────────────────────
@@ -338,11 +340,16 @@ def _note_direction(helpfulness: str) -> str:
 
 
 def build_rater_note_direction(ratings_by_note: dict) -> dict:
-    """rater -> {noteId: 'helpful'|'not_helpful'|'other'} from ratings_by_note."""
+    """rater -> {noteId: 'helpful'|'not_helpful'|'other'} from ratings_by_note.
+    Rows with no participantId (unknown rater) are skipped: they must not be
+    aggregated into a fake rater key."""
     rater_note_dir = defaultdict(dict)
     for nid, rs in ratings_by_note.items():
         for r in rs:
-            rater_note_dir[r["participantId"]][nid] = _note_direction(r.get("helpfulness") or "")
+            pid = r.get("participantId")
+            if not pid:
+                continue
+            rater_note_dir[pid][nid] = _note_direction(r.get("helpfulness") or "")
     return rater_note_dir
 
 
@@ -695,7 +702,13 @@ def synchronized_bursts(ratings_by_note: dict, note_handle: dict, window_ms: int
 
 def baseline_vs_target_overlap(rater_notes: dict, baseline_by_rater: dict, clusters: list, max_rows: int = 200) -> list:
     """V6: per flagged cluster, mean pairwise Jaccard on target notes vs. the same
-    members' overlap on their (non-target) baseline note sample."""
+    members' overlap on their (non-target) baseline note sample.
+
+    A member with NO baseline sample is "missing", not zero: only pairs where BOTH
+    members have baseline data contribute to mean_baseline_overlap, and when no member
+    has baseline data the row reports None (null) for mean_baseline_overlap/overlap_lift
+    — never a fabricated 0.0 baseline or a lift equal to the target overlap.
+    """
     rows = []
     for c in clusters[:max_rows]:
         members = c["member_participant_ids"]
@@ -704,11 +717,12 @@ def baseline_vs_target_overlap(rater_notes: dict, baseline_by_rater: dict, clust
             for i, a in enumerate(members)
             for b in members[i + 1:]
         ]
-        base_sets = {m: set(baseline_by_rater.get(m, [])) for m in members}
+        base_sets = {m: set(baseline_by_rater.get(m) or []) for m in members}
+        base_members = [m for m in members if base_sets[m]]
         base = [
             _jaccard(base_sets[a], base_sets[b])
-            for i, a in enumerate(members)
-            for b in members[i + 1:]
+            for i, a in enumerate(base_members)
+            for b in base_members[i + 1:]
         ]
         mean_tgt = round(sum(tgt) / len(tgt), 4) if tgt else 0.0
         mean_base = round(sum(base) / len(base), 4) if base else None
@@ -730,9 +744,28 @@ def permutation_p_value(observed: float, null_values: list, permutations: int) -
     return round((1 + exceed) / (permutations + 1), 4)
 
 
+def _permute_note_labels(sub: dict, note_pool: list, rng) -> dict:
+    """One permutation-null draw: every rater keeps its EXACT rated-note-set size, but the
+    notes are a uniform sample WITHOUT replacement from the shared pool (a label shuffle
+    among raters). Drawing with replacement would collapse duplicates and make null sets
+    systematically sparser than observed, biasing p-values anti-conservatively."""
+    perm = {}
+    pool_len = len(note_pool)
+    for r, notes in sub.items():
+        k = len(notes)
+        if k == 0:
+            perm[r] = set()
+        elif k >= pool_len:
+            perm[r] = set(note_pool)
+        else:
+            perm[r] = set(rng.sample(note_pool, k))
+    return perm
+
+
 def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: int, min_notes: int,
                      permutations: int = 200, seed: int = 12345, max_raters: int = 1500) -> dict:
-    """V6: permutation null — shuffle note labels among raters `permutations` times and
+    """V6: permutation null — shuffle note labels among raters `permutations` times (each
+    rater keeps its set size; notes sampled without replacement from the shared pool) and
     rebuild clusters, giving a null distribution for max cluster size and mean overlap.
     Rater count is capped (random sample, seeded) to bound runtime on large inputs."""
     rng = random.Random(seed)
@@ -749,9 +782,7 @@ def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: in
     null_mean_overlap = []
     perms = max(0, permutations)
     for _ in range(perms):
-        perm = defaultdict(set)
-        for r, _ in ratings:
-            perm[r].add(note_pool[rng.randrange(len(note_pool))])
+        perm = _permute_note_labels(sub, note_pool, rng)
         null_clusters = find_corating_clusters(perm, min_overlap=min_overlap, min_cluster_size=min_cluster_size, min_notes=min_notes)
         if null_clusters:
             null_max_size.append(max(c["size"] for c in null_clusters))
@@ -831,6 +862,33 @@ def _parse_device_login_output(text: str) -> dict:
     if m:
         out["user_code"] = m.group(1)
     return out
+
+
+# Keys stripped from any grok_auth value before it is stored on the workflow (result +
+# get_grok_auth query): the device code and verification URL are secrets-in-transit and
+# must never appear in the result, queries, or logs. The two strings below are dict KEY
+# names, not credentials (set literal, not an auth tuple).
+_GROK_AUTH_SECRET_KEYS = {"user_code", "verification_url"}  # ggignore
+
+
+def _public_grok_auth(d: Optional[dict]) -> Optional[dict]:
+    """Result/query-safe view of grok device-login state (strips user_code/verification_url)."""
+    if d is None:
+        return None
+    return {k: v for k, v in d.items() if k not in _GROK_AUTH_SECRET_KEYS}
+
+
+def _omit_tweet_ids_from_result(targets: list, findings: dict) -> None:
+    """omit_tweet_ids_from_result: drop tweet-id lists from the result, keep only counts.
+    Covers targets[].tweet_ids, per_handle[].noted_tweet_ids AND findings[].notes[].tweetId,
+    so no tweet-id lists remain anywhere in the returned payload."""
+    for t in targets:
+        t["tweet_ids"] = []
+    for v in (findings.get("per_handle") or {}).values():
+        v["noted_tweet_ids_count"] = len(v.get("noted_tweet_ids") or [])
+        v["noted_tweet_ids"] = []
+    for n in findings.get("notes") or []:
+        n.pop("tweetId", None)
 
 
 _USER_ID_RE = re.compile(r"(?:USER_ID|userId|user_id)\"?\s*[:=]\s*\"?(\d{5,})\"?", re.IGNORECASE)
@@ -1459,6 +1517,25 @@ _FULL_TO_HCODE = {"HELPFUL": "H", "SOMEWHAT_HELPFUL": "S", "NOT_HELPFUL": "N"}
 _HCODE_TO_FULL = {"H": "HELPFUL", "S": "SOMEWHAT_HELPFUL", "N": "NOT_HELPFUL"}
 
 
+def _attribute_baseline_pool(pool: list, target_raters: set, pidx: dict, max_raters: int, per_rater: int) -> dict:
+    """Attribute the order-independent non-target reservoir to target-note raters only.
+
+    `pool` is a bounded reservoir of (pid, noteId) non-target rating rows collected during
+    the stream regardless of row order (a rater's non-target rows may precede its first
+    target-note row). Returns pidx -> [noteIds], capped at `max_raters` raters and
+    `per_rater` notes each — memory- and payload-bounded."""
+    by_rater = defaultdict(list)
+    for pid, nid in pool:
+        if pid in target_raters and pid in pidx:
+            by_rater[pidx[pid]].append(nid)
+    out = {}
+    for i, nids in by_rater.items():
+        if len(out) >= max_raters:
+            break
+        out[i] = nids[:per_rater]
+    return out
+
+
 def _rater_pid(row: dict):
     """Rater id from a ratings row: noteRatings header is raterParticipantId (older snapshots: participantId)."""
     return row.get("raterParticipantId") or row.get("participantId")  # pseudonymous only
@@ -1482,7 +1559,11 @@ def _denormalize_data(data: dict) -> dict:
             if isinstance(r, dict):
                 norm.append(r)
             else:
-                pid = participants[r[0]] if participants is not None else r[0]
+                # r[0] == -1 means "unknown rater" (missing rater column): map to None, NEVER
+                # to participants[-1] — that would credit an unrelated real rater (or crash
+                # on an empty participants list). Unknown-rater rows still feed the per-note
+                # time series/bursts, they are just not attributed to any rater downstream.
+                pid = participants[r[0]] if participants is not None and 0 <= r[0] < len(participants) else None
                 norm.append({
                     "noteId": nid,
                     "participantId": pid,  # pseudonymous only
@@ -1511,10 +1592,13 @@ def _denormalize_data(data: dict) -> dict:
 async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, baseline_sample_per_rater: int = 20) -> dict:
     """Ratings + note status history restricted to target notes (streamed), plus source info per table.
 
-    While streaming, also keeps a reservoir-style sample of up to `baseline_sample_per_rater`
-    NON-target ratings for up to BASELINE_MAX_RATERS target-note raters (V6 baseline/null
-    model) — memory- and payload-bounded. The return is compact/indexed (see
-    _denormalize_data) so multi-handle runs stay under the activity-result payload cap.
+    While streaming, also keeps an ORDER-INDEPENDENT reservoir (bounded to
+    BASELINE_MAX_RATERS * baseline_sample_per_rater rows) of NON-target rating rows,
+    attributed after the scan to up to BASELINE_MAX_RATERS target-note raters with up to
+    `baseline_sample_per_rater` notes each (V6 baseline/null model) — a rater's non-target
+    rows may stream before its first target-note row, so order must not matter. Memory-
+    and payload-bounded. The return is compact/indexed (see _denormalize_data) so
+    multi-handle runs stay under the activity-result payload cap.
     """
     import httpx
 
@@ -1537,8 +1621,10 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
     status_rows_scanned = 0
     rng = random.Random(12345)  # deterministic baseline sampling
     target_raters_seen = set()
-    baseline_by_rater = defaultdict(list)  # pidx -> [non-target noteIds]
-    baseline_seen = defaultdict(int)
+    # order-independent reservoir over NON-target rows, bounded in memory (see docstring)
+    baseline_pool: list = []  # [(pid, noteId), ...]
+    baseline_pool_seen = 0
+    pool_max = BASELINE_MAX_RATERS * max(1, baseline_sample_per_rater)
     async with httpx.AsyncClient(timeout=120.0) as client:
         # ratings
         ratings_urls = await _shard_urls(client, CN_TABLES["ratings"], ratings_diag)
@@ -1556,17 +1642,17 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
                         int(row.get("createdAtMillis") or 0),
                         _FULL_TO_HCODE.get((row.get("helpfulnessLevel") or "").upper(), ""),
                     ])
-                elif (baseline_sample_per_rater > 0 and pid and pid in target_raters_seen
-                        and (pidx[pid] in baseline_by_rater or len(baseline_by_rater) < BASELINE_MAX_RATERS)):
-                    i = pidx[pid]
-                    lst = baseline_by_rater[i]
-                    baseline_seen[i] += 1
-                    if len(lst) < baseline_sample_per_rater:
-                        lst.append(nid)
+                elif baseline_sample_per_rater > 0 and pid:
+                    # V6 baseline pool: reservoir-sample EVERY non-target row with a rater id,
+                    # regardless of stream order; attribution to target raters happens after
+                    # the scan via _attribute_baseline_pool
+                    baseline_pool_seen += 1
+                    if len(baseline_pool) < pool_max:
+                        baseline_pool.append((pid, nid))
                     else:
-                        j = rng.randrange(baseline_seen[i])
-                        if j < baseline_sample_per_rater:
-                            lst[j] = nid
+                        j = rng.randrange(baseline_pool_seen)
+                        if j < pool_max:
+                            baseline_pool[j] = (pid, nid)
         # status history
         if detect_flips:
             status_urls = await _shard_urls(client, CN_TABLES["status"], status_diag)
@@ -1580,7 +1666,9 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
                         ts = row.get("timestampMillisOfCurrentStatus") or row.get("createdAtMillis") or 0
                         status_by_note[nid].append([int(ts or 0), (status or "").upper()])
     if baseline_sample_per_rater > 0:
-        baseline_by_rater = {i: lst[:baseline_sample_per_rater] for i, lst in baseline_by_rater.items()}
+        baseline_by_rater = _attribute_baseline_pool(
+            baseline_pool, target_raters_seen, pidx, BASELINE_MAX_RATERS, baseline_sample_per_rater
+        )
     else:
         baseline_by_rater = {}
     ratings_source = {
@@ -1669,11 +1757,12 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
     ratings_by_note = data["ratings_by_note"]
     status_by_note = data.get("status_by_note", {})
 
-    # rater -> target notes they rated
+    # rater -> target notes they rated (unknown-rater rows excluded: bursts still see them)
     rater_notes = defaultdict(set)
     for nid, rs in ratings_by_note.items():
         for r in rs:
-            rater_notes[r["participantId"]].add(nid)
+            if r.get("participantId"):
+                rater_notes[r["participantId"]].add(nid)
     # rater -> {noteId: direction} for the direction-aware vectors
     rater_note_dir = build_rater_note_direction(ratings_by_note)
 
@@ -1698,11 +1787,17 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
     max_rows = p.max_vector_rows_in_result
 
     v1 = None
+    v1_flagged_full = None  # full (uncapped) flagged set for V3 cross-references
     if _vector_enabled(p, "cross_handle_rater_map"):
         v1 = cross_handle_rater_map(rater_note_dir, note_handle, min_handles=p.cross_handle_min_handles, max_rows=max_rows)
         vectors["cross_handle_rater_map"] = v1
+        v1_flagged_full = {
+            r for r, ns in rater_note_dir.items()
+            if len({note_handle.get(n, "unknown") for n in ns}) >= p.cross_handle_min_handles
+        }
 
     v2 = None
+    v2_flagged_full = None  # full (uncapped) flagged set for V3 cross-references
     direction_clusters = []
     if _vector_enabled(p, "direction_lockstep"):
         v2 = direction_lockstep(
@@ -1711,6 +1806,7 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             one_sided_threshold=p.direction_one_sided_threshold,
             max_rows=max_rows,
         )
+        v2_flagged_full = set(v2["flagged_participant_ids"])  # capture BEFORE the emitted list is capped
         direction_clusters = find_direction_clusters(
             rater_note_dir,
             min_overlap=p.min_co_rating_overlap,
@@ -1724,7 +1820,7 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             for c in direction_clusters[:max_rows]
         ]
         v2["summary"]["direction_clusters_flagged"] = len(direction_clusters)
-        v2["flagged_participant_ids"] = v2["flagged_participant_ids"][:max_rows]
+        v2["flagged_participant_ids"] = v2["flagged_participant_ids"][:max_rows]  # only the emitted list is capped
         vectors["direction_lockstep"] = v2
 
     v3 = None
@@ -1734,8 +1830,8 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             enrollment_rows,
             min_cohort_size=p.enrollment_cohort_min_size,
             max_rows=max_rows,
-            cross_handle_ids={r["participantId"] for r in (v1 or {}).get("rows", [])} if v1 else None,
-            lockstep_ids=set((v2 or {}).get("flagged_participant_ids") or []) if v2 else None,
+            cross_handle_ids=v1_flagged_full,
+            lockstep_ids=v2_flagged_full,
         )
         if data.get("enrollment_source_unavailable"):
             v3["unavailable"] = True
@@ -1780,8 +1876,26 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
         # approximate per-cluster p-values against the null max-cluster-size distribution
         for c in clusters:
             c["permutation_p_value"] = permutation_p_value(c["size"], null["null_max_cluster_size"], null["params"]["permutations"])
-        for c in direction_clusters:
+        # direction clusters: attach to the EMITTED copies in v2 (they are shallow copies made
+        # above, so attaching to the originals would never reach findings/LLM/markdown)
+        for c in (v2 or {}).get("direction_clusters", []):
             c["permutation_p_value"] = permutation_p_value(c["size"], null["null_max_cluster_size"], null["params"]["permutations"])
+
+    # exact cohort membership for the per-handle score bonus, computed from the FULL
+    # enrollment rows (not the row-capped v3 lists, which would silently undercount)
+    enroll_day: dict = {}
+    for row in (data.get("enrollment_rows") or []):
+        ts = row.get("createdAtMillis") or 0
+        pid = row.get("participantId")
+        if ts and pid:
+            enroll_day[pid] = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    day_sizes = defaultdict(int)
+    for d in enroll_day.values():
+        day_sizes[d] += 1
+    flagged_cohort_days = (
+        {d for d, s in day_sizes.items() if s >= p.enrollment_cohort_min_size}
+        if v3 is not None and not v3.get("unavailable") else set()
+    )
 
     # attribute clusters/bursts/flips to handles via their notes
     handle_notes = defaultdict(list)
@@ -1806,9 +1920,8 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             "sync_burst_groups": sum(1 for r in (v5 or {}).get("rows", []) if h in r.get("handles", [])),
             "author_coordination": sum(1 for r in (v4 or {}).get("multi_handle_authors", []) if h in r.get("handles", [])),
             "enrollment_cohort_raters": sum(
-                1 for row in (v3 or {}).get("rows", [])
-                for m in row.get("member_participant_ids", [])
-                if m in rater_notes and any(note_handle.get(n) == h for n in rater_notes[m])
+                1 for r, ns in rater_notes.items()
+                if enroll_day.get(r) in flagged_cohort_days and any(note_handle.get(n) == h for n in ns)
             ),
         }
         score, severity = score_handle(len(h_notes), h_clusters, h_bursts, h_flips, vector_hits)
@@ -1970,17 +2083,19 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         if p.handle_source in ("grok_cli", "auto"):
             start = await grok_device_login_start()
             if start.get("status") == "pending":
+                # the label is the one-time input prompt shown to the runner; the code itself is
+                # stripped from everything stored/returned (result, get_grok_auth query, logs)
                 label = f"grok device login: open {start['verification_url']} and enter code {start['user_code']}"
                 try:
                     # The submitted code is used only to confirm the input was provided; it is
                     # never stored in the result, queries, or logs (device codes are secrets-in-transit).
                     await self.wait_for_input(GrokDeviceLoginInput, label=label, timeout=timedelta(minutes=10))
                     wait = await grok_device_login_wait(start["pid"])
-                    grok_auth = {**start, "status": wait["status"]}
+                    grok_auth = _public_grok_auth({**start, "status": wait["status"]})
                 except asyncio.TimeoutError:
-                    grok_auth = {**start, "status": "input_timeout"}
+                    grok_auth = _public_grok_auth({**start, "status": "input_timeout"})
             else:
-                grok_auth = start
+                grok_auth = _public_grok_auth(start)
             self.grok_auth = grok_auth
 
         self.steps["resolve_targets"] = "running"
@@ -2087,11 +2202,7 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
 
         if p.omit_tweet_ids_from_result:
             # drop the tweet-id lists from the result, keep only counts (tweets_scanned stays)
-            for t in targets:
-                t["tweet_ids"] = []
-            for v in findings["per_handle"].values():
-                v["noted_tweet_ids_count"] = len(v.get("noted_tweet_ids") or [])
-                v["noted_tweet_ids"] = []
+            _omit_tweet_ids_from_result(targets, findings)
 
         report_markdown = _render_markdown(targets, findings, assessment, p, data_sources=data_sources, ratings_source_unavailable=ratings_source_unavailable, status_source_unavailable=status_source_unavailable, enrollment_source_unavailable=data["enrollment_source_unavailable"])
         return {

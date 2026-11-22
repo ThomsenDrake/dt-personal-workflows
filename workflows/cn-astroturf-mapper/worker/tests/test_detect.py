@@ -3,7 +3,11 @@ import asyncio
 
 from worker.workflows.cn_astroturf_mapper import (
     AstroturfMapperInput,
+    _attribute_baseline_pool,
     _denormalize_data,
+    _omit_tweet_ids_from_result,
+    _permute_note_labels,
+    _public_grok_auth,
     _rater_pid,
     baseline_vs_target_overlap,
     cross_handle_rater_map,
@@ -392,3 +396,121 @@ def test_detect_coordination_accepts_compact_load_shape():
     # enrollment_ms was expanded back into rows (all 6 on the same UTC day; cohort < 10 not flagged)
     assert f["vectors"]["enrollment_cohorts"]["summary"]["raters_with_enrollment"] == 6
     assert f["vectors"]["enrollment_cohorts"]["summary"]["cohorts_flagged"] == 0
+
+
+# ── Review-fix regression tests (PR #17 morning-star findings 1-8) ──
+
+import random as _random
+
+
+def test_f1_missing_baseline_is_null_not_zero():
+    # cluster members with NO baseline sample must report None, not a fabricated 0.0/lift
+    rater_notes = {"a": {"n1", "n2"}, "b": {"n1", "n2"}, "c": {"n1", "n2"}}
+    clusters = [{"cluster_id": "C-x", "size": 3, "member_participant_ids": ["a", "b", "c"]}]
+    rows = baseline_vs_target_overlap(rater_notes, {}, clusters)
+    assert rows[0]["mean_target_overlap"] == 1.0
+    assert rows[0]["mean_baseline_overlap"] is None
+    assert rows[0]["overlap_lift"] is None
+    # partial baseline: only members WITH a baseline sample contribute to the mean
+    rows = baseline_vs_target_overlap(rater_notes, {"a": ["b1"], "b": ["b1"]}, clusters)
+    assert rows[0]["mean_baseline_overlap"] == 1.0  # only the (a,b) pair has baseline data
+    assert rows[0]["overlap_lift"] == 0.0
+
+
+def test_f2_permutation_null_preserves_set_sizes():
+    rng = _random.Random(7)
+    sub = {"r1": {"n1", "n2", "n3"}, "r2": {"n1", "n2"}, "r3": {"n4"}}
+    pool = sorted({"n1", "n2", "n3", "n4", "n5"})
+    for _ in range(50):
+        perm = _permute_note_labels(sub, pool, rng)
+        for r, notes in sub.items():
+            assert len(perm[r]) == len(notes)  # exact size preserved (no with-replacement shrinkage)
+            assert perm[r] <= set(pool)
+    # end-to-end: p-values stay in [0, 1]
+    null = permutation_null({"a": {"n1", "n2", "n3"}, "b": {"n1", "n2", "n3"}, "c": {"n1", "n2", "n3"}},
+                            min_overlap=0.5, min_cluster_size=3, min_notes=3, permutations=20)
+    assert 0.0 <= null["summary"]["p_value_max_cluster_size"] <= 1.0
+    assert 0.0 <= null["summary"]["p_value_mean_overlap"] <= 1.0
+
+
+def test_f3_negative_rater_index_maps_to_none_and_is_not_attributed():
+    data = {
+        "participants": ["r0"],
+        "ratings_by_note": {"n1": [[0, 100, "H"], [-1, 200, "H"]]},  # -1 = missing rater column
+        "status_by_note": {},
+    }
+    out = _denormalize_data(data)
+    assert out["ratings_by_note"]["n1"][0]["participantId"] == "r0"
+    assert out["ratings_by_note"]["n1"][1]["participantId"] is None  # NOT participants[-1]
+    # and detect_coordination never builds a rater entry for the unknown rater
+    p = AstroturfMapperInput(target_handles=["h"], max_vector_rows_in_result=10)
+    targets = [{"handle": "h", "tweet_ids": ["t1"], "tweets_scanned": 1}]
+    notes = [{"noteId": "n1", "tweetId": "t1", "author_participant_id": "x", "createdAtMillis": 1,
+              "classification": "MISINFORMED_OR_POTENTIALLY_MISLEADING", "summary_excerpt": "s"}]
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    v1 = f["vectors"]["cross_handle_rater_map"]
+    assert v1["summary"]["raters_total"] == 1  # only r0; None is not a rater
+    assert all(r["participantId"] != None for r in v1["rows"]) if v1["rows"] else True
+
+
+def test_f4_v3_cross_reference_uses_full_uncapped_sets():
+    p, targets, notes, data = _two_handle_fixture()
+    p.max_vector_rows_in_result = 2          # emitted rows capped at 2 ...
+    p.enrollment_cohort_min_size = 3         # ... but all 6 raters share one creation day
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    v2 = f["vectors"]["direction_lockstep"]
+    assert len(v2["rows"]) == 2 and v2["summary"]["flagged_raters"] == 6
+    assert len(v2["flagged_participant_ids"]) == 2  # emitted id list stays capped
+    v3 = f["vectors"]["enrollment_cohorts"]
+    row = v3["rows"][0]
+    assert row["cohort_size"] == 6
+    # ... while the cross-reference counts see the FULL flagged sets, not the top-2 rows
+    assert row["members_in_cross_handle_map"] == 6
+    assert row["members_flagged_lockstep"] == 6
+    # per-handle score bonus is also exact (not derived from capped member lists)
+    assert f["per_handle"]["h1"]["vector_hits"]["enrollment_cohort_raters"] == 6
+    assert f["per_handle"]["h2"]["vector_hits"]["enrollment_cohort_raters"] == 6
+
+
+def test_f5_direction_clusters_carry_p_value_in_output():
+    p, targets, notes, data = _two_handle_fixture()
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    dcs = f["vectors"]["direction_lockstep"]["direction_clusters"]
+    assert dcs, "fixture should produce a direction cluster"
+    for c in dcs:
+        assert "permutation_p_value" in c  # attached to the EMITTED copies, not just the originals
+        assert 0.0 <= c["permutation_p_value"] <= 1.0
+
+
+def test_f6_public_grok_auth_strips_device_code():
+    start = {"status": "pending", "verification_url": "https://x.ai/activate", "user_code": "ABCD-1234", "pid": 42}
+    pub = _public_grok_auth({**start, "status": "authenticated"})
+    assert "user_code" not in pub and "verification_url" not in pub
+    assert pub["status"] == "authenticated" and pub["pid"] == 42
+    assert _public_grok_auth(None) is None
+
+
+def test_f7_omit_tweet_ids_also_strips_findings_notes():
+    targets = [{"handle": "h", "tweet_ids": ["t1", "t2"], "tweets_scanned": 2}]
+    findings = {
+        "per_handle": {"h": {"noted_tweet_ids": ["t1"], "coordination_score": 1.0}},
+        "notes": [{"noteId": "n1", "tweetId": "t1", "author_participant_id": "x"}],
+    }
+    _omit_tweet_ids_from_result(targets, findings)
+    assert targets[0]["tweet_ids"] == []
+    assert findings["per_handle"]["h"]["noted_tweet_ids"] == []
+    assert findings["per_handle"]["h"]["noted_tweet_ids_count"] == 1
+    assert "tweetId" not in findings["notes"][0]  # no tweet ids left anywhere in the payload
+    assert findings["notes"][0]["noteId"] == "n1"
+
+
+def test_f8_baseline_pool_attribution_is_order_independent_and_bounded():
+    # pool rows may arrive before the rater's first target rating — order must not matter
+    pidx = {"r0": 0, "r1": 1}
+    pool = [("r0", "b1"), ("rX", "b9"), ("r0", "b2"), ("r1", "b3"), ("r0", "b4")]
+    out = _attribute_baseline_pool(pool, {"r0", "r1"}, pidx, max_raters=400, per_rater=2)
+    assert out[0] == ["b1", "b2"]          # r0 keeps at most per_rater notes
+    assert out[1] == ["b3"]                # r1 attributed too
+    assert all(v != ["b9"] for v in out.values())  # non-target rater rX excluded
+    capped = _attribute_baseline_pool(pool, {"r0", "r1"}, pidx, max_raters=1, per_rater=20)
+    assert len(capped) == 1                # rater cap respected

@@ -80,6 +80,7 @@ Env vars:
 from __future__ import annotations
 
 import asyncio
+import bisect
 import csv
 import hashlib
 import io
@@ -773,12 +774,18 @@ def _permute_note_labels(sub: dict, note_pool: list, rng) -> dict:
     replacement (Efraimidis–Spirakis keys) — duplicates in the pool must never shrink a
     null set below its observed size (that would bias p-values anti-conservatively)."""
     labels = sorted(set(note_pool))
-    weights = None
+    cum = None
+    total_w = 0.0
     if len(labels) < len(note_pool):
+        # popularity-weighted pool: precompute cumulative weights ONCE per pool, then each
+        # draw is O(log L) via bisect — never a per-rater O(L log L) sort of the whole pool
         counts = defaultdict(int)
         for n in note_pool:
             counts[n] += 1
-        weights = [counts[l] for l in labels]
+        cum = []
+        for l in labels:
+            total_w += counts[l]
+            cum.append(total_w)
     n_labels = len(labels)
     perm = {}
     for r, notes in sub.items():
@@ -787,14 +794,21 @@ def _permute_note_labels(sub: dict, note_pool: list, rng) -> dict:
             perm[r] = set()
         elif k >= n_labels:
             perm[r] = set(labels)
-        elif weights is None:
+        elif cum is None:
             perm[r] = set(rng.sample(labels, k))
         else:
-            keys = sorted(
-                ((rng.random() ** (1.0 / w) if w > 0 else 0.0, l) for l, w in zip(labels, weights)),
-                reverse=True,
-            )
-            perm[r] = {l for _, l in keys[:k]}
+            # weighted draw of k DISTINCT labels: bisect + rejection on duplicates, with a
+            # bounded guard and an exact fill from the remaining labels if it stalls
+            drawn = set()
+            guard = 0
+            while len(drawn) < k and guard < 10 * k + 100:
+                i = bisect.bisect_right(cum, rng.random() * total_w)
+                drawn.add(labels[i])
+                guard += 1
+            if len(drawn) < k:
+                rest = [l for l in labels if l not in drawn]
+                drawn.update(rng.sample(rest, k - len(drawn)))
+            perm[r] = drawn
     return perm
 
 

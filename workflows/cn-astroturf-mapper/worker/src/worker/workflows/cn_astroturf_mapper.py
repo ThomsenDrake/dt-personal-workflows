@@ -538,8 +538,9 @@ def find_enrollment_cohorts(enrollment_rows: list, min_cohort_size: int = 10, ma
                 "creation_day_utc": day,
                 "cohort_size": len(members),
                 "member_participant_ids": members[:max_rows],  # pseudonymous ONLY
-                "members_in_cross_handle_map": len(set(members) & cross_handle_ids) if cross_handle_ids else 0,
-                "members_flagged_lockstep": len(set(members) & lockstep_ids) if lockstep_ids else 0,
+                # None (not 0) when the V1/V2 vector is disabled: unknown, not "zero members"
+                "members_in_cross_handle_map": len(set(members) & cross_handle_ids) if cross_handle_ids is not None else None,
+                "members_flagged_lockstep": len(set(members) & lockstep_ids) if lockstep_ids is not None else None,
             })
     rows.sort(key=lambda r: -r["cohort_size"])
     return {
@@ -590,6 +591,11 @@ def note_author_coordination(notes: list, note_handle: dict, min_handles: int = 
         if len(hs) >= min_handles
     ]
     multi.sort(key=lambda r: (-r["handles_spanned"], -r["notes_written"], r["participantId"]))
+    # per-handle counts over ALL multi-handle authors (before the row cap)
+    handle_author_counts = defaultdict(int)
+    for m in multi:
+        for h in m["handles"]:
+            handle_author_counts[h] += 1
     dups = []
     for a, ns in author_notes.items():
         sh = {n["noteId"]: _shingles(n.get("summary_excerpt") or "", shingle_size) for n in ns}
@@ -617,6 +623,7 @@ def note_author_coordination(notes: list, note_handle: dict, min_handles: int = 
         },
         "multi_handle_authors": multi[:max_rows],
         "duplicate_summary_pairs": dups[:max_rows],
+        "handle_author_counts": dict(handle_author_counts),
     }
 
 
@@ -679,9 +686,14 @@ def synchronized_bursts(ratings_by_note: dict, note_handle: dict, window_ms: int
         note_ids = {w["noteId"] for w in grp}
         if len(note_ids) < 2:
             continue
-        counts = defaultdict(int)
+        # count each rater once per DISTINCT note in the group: windows of the SAME note
+        # (up to max_windows_per_note per note) must not inflate the shared-rater count
+        note_raters = defaultdict(set)
         for w in grp:
-            for pid in w["raters"]:
+            note_raters[w["noteId"]] |= w["raters"]
+        counts = defaultdict(int)
+        for pids in note_raters.values():
+            for pid in pids:
                 counts[pid] += 1
         shared = sorted(pid for pid, c in counts.items() if c >= 2)
         if len(shared) >= min_shared_raters:
@@ -695,10 +707,17 @@ def synchronized_bursts(ratings_by_note: dict, note_handle: dict, window_ms: int
                 "shared_raters": shared[:max_rows],  # pseudonymous ONLY
             })
     rows.sort(key=lambda r: (-r["shared_rater_count"], r["window_start_ms"]))
+    # per-handle group counts over ALL flagged groups (before the row cap), so downstream
+    # per-handle vector_hits never undercount
+    handle_group_counts = defaultdict(int)
+    for r in rows:
+        for h in r["handles"]:
+            handle_group_counts[h] += 1
     return {
         "params": {"window_ms": window_ms, "min_ratings": min_ratings, "one_sided_ratio": one_sided_ratio,
                    "min_shared_raters": min_shared_raters, "max_rows": max_rows},
         "summary": {"burst_windows": len(windows), "sync_groups_flagged": len(rows)},
+        "handle_group_counts": dict(handle_group_counts),
         "rows": rows[:max_rows],
     }
 
@@ -765,14 +784,31 @@ def _permute_note_labels(sub: dict, note_pool: list, rng) -> dict:
     return perm
 
 
+# Cap on how many times one note may enter the permutation null's label pool — reflects
+# per-note rating popularity in the null without letting one mega-note dominate it.
+NOTE_POOL_POPULARITY_CAP = 10
+
+
+def _note_label_pool(ratings: list, cap: int = NOTE_POOL_POPULARITY_CAP) -> list:
+    """Label pool for the permutation null: each distinct note appears min(rating count, cap)
+    times, so null draws reflect per-note popularity (capped) instead of uniform-over-notes."""
+    counts = defaultdict(int)
+    for _, n in ratings:
+        counts[n] += 1
+    return sorted(n for n, c in counts.items() for _ in range(min(c, cap)))
+
+
 def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: int, min_notes: int,
                      permutations: int = 200, seed: int = 12345, max_raters: int = 1500) -> dict:
     """V6: permutation null — shuffle note labels among raters `permutations` times (each
     rater keeps its set size; notes sampled without replacement from the shared pool) and
     rebuild clusters, giving a null distribution for max cluster size and mean overlap.
-    Rater count is capped (random sample, seeded) to bound runtime on large inputs."""
+    Rater count is capped (random sample, seeded) to bound runtime on large inputs; when
+    that subsampling happens, params report raters_qualifying > raters_used so callers can
+    refuse to compare uncapped observed sizes against the subsampled null."""
     rng = random.Random(seed)
-    raters = [r for r, notes in rater_notes.items() if len(notes) >= min_notes]
+    qualifying = [r for r, notes in rater_notes.items() if len(notes) >= min_notes]
+    raters = qualifying
     if len(raters) > max_raters:
         raters = rng.sample(raters, max_raters)
     sub = {r: set(rater_notes[r]) for r in raters}
@@ -780,7 +816,7 @@ def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: in
     obs_max_size = max((c["size"] for c in observed), default=0)
     obs_mean_overlap = max((c["mean_pairwise_overlap"] for c in observed), default=0.0)
     ratings = [(r, n) for r in raters for n in sub[r]]
-    note_pool = sorted({n for _, n in ratings})
+    note_pool = _note_label_pool(ratings)
     null_max_size = []
     null_mean_overlap = []
     perms = max(0, permutations)
@@ -795,7 +831,7 @@ def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: in
             null_mean_overlap.append(0.0)
     return {
         "params": {"permutations": perms, "min_overlap": min_overlap, "min_cluster_size": min_cluster_size,
-                   "min_notes": min_notes, "raters_used": len(raters), "seed": seed},
+                   "min_notes": min_notes, "raters_used": len(raters), "raters_qualifying": len(qualifying), "seed": seed},
         "summary": {
             "observed_max_cluster_size": obs_max_size,
             "observed_mean_overlap": round(obs_mean_overlap, 4),
@@ -868,10 +904,10 @@ def _parse_device_login_output(text: str) -> dict:
 
 
 # Keys stripped from any grok_auth value before it is stored on the workflow (result +
-# get_grok_auth query): the device code and verification URL are secrets-in-transit and
-# must never appear in the result, queries, or logs. The two strings below are dict KEY
-# names, not credentials (set literal, not an auth tuple).
-_GROK_AUTH_SECRET_KEYS = {"user_code", "verification_url"}  # ggignore
+# get_grok_auth query): the device code is a secret-in-transit and must never appear in
+# the result, queries, or logs. The verification URL is public and stays (documented
+# get_grok_auth contract). Single-element set of a dict KEY name, not an auth tuple.
+_GROK_AUTH_SECRET_KEYS = {"user_code"}  # ggignore
 
 
 def _public_grok_auth(d: Optional[dict]) -> Optional[dict]:
@@ -1896,13 +1932,40 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             "null_max_cluster_size": null["null_max_cluster_size"],
             "null_mean_overlap": null["null_mean_overlap"],
         }
-        # approximate per-cluster p-values against the null max-cluster-size distribution
+        # Approximate per-cluster p-values against the null max-cluster-size distribution.
+        # Only attach when the null was built on the SAME (uncapped) rater population: with a
+        # subsampled null (raters_used < raters_qualifying) a large observed cluster would
+        # always get the minimum p-value purely as a subsample artifact — report null instead.
+        subsampled = null["params"]["raters_used"] < null["params"]["raters_qualifying"]
         for c in clusters:
-            c["permutation_p_value"] = permutation_p_value(c["size"], null["null_max_cluster_size"], null["params"]["permutations"])
-        # direction clusters: attach to the EMITTED copies in v2 (they are shallow copies made
-        # above, so attaching to the originals would never reach findings/LLM/markdown)
+            c["permutation_p_value"] = (
+                None if subsampled
+                else permutation_p_value(c["size"], null["null_max_cluster_size"], null["params"]["permutations"])
+            )
+        # Direction clusters: p-values from a SEPARATE null built on same-direction-LABELLED
+        # note sets ("helpful:<note>" / "not_helpful:<note>"), so the null statistic matches
+        # the direction-aware clustering; attached to the EMITTED copies in v2 (shallow copies
+        # made above — attaching to the originals would never reach the output).
+        dir_null = None
+        if v2 is not None and (v2.get("direction_clusters") or []):
+            dir_rater_notes = {
+                r: {f"{d}:{n}" for n, d in ns.items() if d in ("helpful", "not_helpful")}
+                for r, ns in rater_note_dir.items() if len(ns) >= p.min_notes_for_rater
+            }
+            if dir_rater_notes:
+                dir_null = permutation_null(
+                    dir_rater_notes,
+                    min_overlap=p.min_co_rating_overlap,
+                    min_cluster_size=p.min_cluster_size,
+                    min_notes=p.min_notes_for_rater,
+                    permutations=p.null_permutations,
+                )
+        dir_subsampled = bool(dir_null and dir_null["params"]["raters_used"] < dir_null["params"]["raters_qualifying"])
         for c in (v2 or {}).get("direction_clusters", []):
-            c["permutation_p_value"] = permutation_p_value(c["size"], null["null_max_cluster_size"], null["params"]["permutations"])
+            c["permutation_p_value"] = (
+                None if (dir_null is None or dir_subsampled)
+                else permutation_p_value(c["size"], dir_null["null_max_cluster_size"], dir_null["params"]["permutations"])
+            )
 
     # exact cohort membership for the per-handle score bonus, computed from the FULL
     # enrollment rows (not the row-capped v3 lists, which would silently undercount)
@@ -1936,12 +1999,17 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
         ]
         h_bursts = [b for b in bursts if b["noteId"] in h_note_ids]
         h_flips = [f for f in flips if f["noteId"] in h_note_ids]
-        # per-handle vector hits folded into the score (small weights, legacy terms unchanged)
+        # per-handle vector hits folded into the score (small weights, legacy terms unchanged).
+        # All counts come from FULL uncapped data (flagged sets / handle count maps computed
+        # before row caps), never from the emitted capped row lists.
         vector_hits = {
-            "cross_handle_raters": sum(1 for r in (v1 or {}).get("rows", []) if h in r.get("handles", [])),
+            "cross_handle_raters": sum(
+                1 for r in (v1_flagged_full or ())
+                if h in {note_handle.get(n, "unknown") for n in rater_note_dir[r]}
+            ),
             "lockstep_raters": ((v2 or {}).get("per_handle", {}).get(h, {}) or {}).get("flagged_raters", 0),
-            "sync_burst_groups": sum(1 for r in (v5 or {}).get("rows", []) if h in r.get("handles", [])),
-            "author_coordination": sum(1 for r in (v4 or {}).get("multi_handle_authors", []) if h in r.get("handles", [])),
+            "sync_burst_groups": ((v5 or {}).get("handle_group_counts", {}) or {}).get(h, 0),
+            "author_coordination": ((v4 or {}).get("handle_author_counts", {}) or {}).get(h, 0),
             "enrollment_cohort_raters": sum(
                 1 for r, ns in rater_notes.items()
                 if enroll_day.get(r) in flagged_cohort_days and any(note_handle.get(n) == h for n in ns)

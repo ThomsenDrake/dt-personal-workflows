@@ -8,6 +8,7 @@ from worker.workflows.cn_astroturf_mapper import (
     _choose_baseline_raters,
     _denormalize_data,
     _omit_tweet_ids_from_result,
+    _note_label_pool,
     _permute_note_labels,
     _public_grok_auth,
     _rater_pid,
@@ -472,6 +473,11 @@ def test_f4_v3_cross_reference_uses_full_uncapped_sets():
     # per-handle score bonus is also exact (not derived from capped member lists)
     assert f["per_handle"]["h1"]["vector_hits"]["enrollment_cohort_raters"] == 6
     assert f["per_handle"]["h2"]["vector_hits"]["enrollment_cohort_raters"] == 6
+    # M3: cross_handle_raters / sync_burst_groups / author_coordination hits are exact too
+    assert f["per_handle"]["h1"]["vector_hits"]["cross_handle_raters"] == 6
+    assert f["per_handle"]["h2"]["vector_hits"]["cross_handle_raters"] == 6
+    assert f["per_handle"]["h1"]["vector_hits"]["sync_burst_groups"] == 1
+    assert f["per_handle"]["h1"]["vector_hits"]["author_coordination"] == 1
 
 
 def test_f5_direction_clusters_carry_p_value_in_output():
@@ -487,7 +493,8 @@ def test_f5_direction_clusters_carry_p_value_in_output():
 def test_f6_public_grok_auth_strips_device_code():
     start = {"status": "pending", "verification_url": "https://x.ai/activate", "user_code": "ABCD-1234", "pid": 42}
     pub = _public_grok_auth({**start, "status": "authenticated"})
-    assert "user_code" not in pub and "verification_url" not in pub
+    assert "user_code" not in pub                      # the device code never leaves the run
+    assert pub["verification_url"] == "https://x.ai/activate"  # public URL stays (documented contract)
     assert pub["status"] == "authenticated" and pub["pid"] == 42
     assert _public_grok_auth(None) is None
 
@@ -555,3 +562,69 @@ def test_f11_baseline_raters_are_pre_bounded_before_pass_2():
     # _cap_raters stays as a no-op safeguard once the set is pre-bounded
     res = {i: ["n"] for i in range(400)}
     assert _cap_raters(res, 400, _random.Random(11)) is res
+
+
+def test_m1_v5_shared_raters_counted_per_distinct_note():
+    # two overlapping windows of the SAME note sharing raters must NOT count as "shared
+    # across notes" — only raters appearing on >= 2 DISTINCT notes in the group qualify
+    base = 1_700_000_000_000
+    same_note_windows_raters = [f"r{i}" for i in range(6)]
+    ratings = {
+        "n1": [{"participantId": p, "createdAtMillis": base + i * 1000, "helpfulness": "HELPFUL"}
+               for i, p in enumerate(same_note_windows_raters)],
+        # second note whose only window has completely disjoint raters
+        "n2": [{"participantId": f"x{i}", "createdAtMillis": base + i * 1000, "helpfulness": "HELPFUL"} for i in range(8)],
+    }
+    out = synchronized_bursts(ratings, {"n1": "h1", "n2": "h2"}, window_ms=30_000, min_ratings=6,
+                              one_sided_ratio=0.8, min_shared_raters=5, max_rows=10, max_windows_per_note=3)
+    assert out["summary"]["sync_groups_flagged"] == 0  # no rater spans 2 distinct notes
+    # positive control: raters on BOTH notes are flagged
+    ratings["n2"] = [{"participantId": f"r{i}", "createdAtMillis": base + i * 1000, "helpfulness": "HELPFUL"} for i in range(6)]
+    out = synchronized_bursts(ratings, {"n1": "h1", "n2": "h2"}, window_ms=30_000, min_ratings=6,
+                              one_sided_ratio=0.8, min_shared_raters=5, max_rows=10, max_windows_per_note=3)
+    assert out["summary"]["sync_groups_flagged"] == 1
+    assert out["rows"][0]["shared_rater_count"] == 6
+    assert out["handle_group_counts"] == {"h1": 1, "h2": 1}  # full per-handle counts, uncapped
+
+
+def test_m2_p_value_null_when_null_was_subsampled():
+    # observed clusters over ALL qualifying raters; null over <= max_raters subsample ->
+    # p-value must be null (not a fabricated minimum p), and params expose the mismatch
+    null = permutation_null({f"r{i}": {"n1", "n2", "n3"} for i in range(10)},
+                            min_overlap=0.5, min_cluster_size=3, min_notes=3,
+                            permutations=5, max_raters=4)
+    assert null["params"]["raters_qualifying"] == 10
+    assert null["params"]["raters_used"] == 4
+    # end-to-end through detect_coordination: >1500 qualifying raters -> subsampled null
+    p = AstroturfMapperInput(target_handles=["h"], min_notes_for_rater=1, min_cluster_size=3,
+                             min_co_rating_overlap=0.9, null_permutations=2, direction_min_ratings=99)
+    targets = [{"handle": "h", "tweet_ids": ["t1"], "tweets_scanned": 1}]
+    notes = [{"noteId": "n1", "tweetId": "t1", "author_participant_id": "x", "createdAtMillis": 1,
+              "classification": "MISINFORMED_OR_POTENTIALLY_MISLEADING", "summary_excerpt": "s"}]
+    ratings = {"n1": [{"participantId": f"r{i}", "createdAtMillis": i, "helpfulness": "HELPFUL"} for i in range(1600)]}
+    data = {"ratings_by_note": ratings, "status_by_note": {}, "total_ratings_kept": 1600,
+            "vectors": {"enrollment_cohorts": False}}
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    assert f["all_clusters"] and f["all_clusters"][0]["permutation_p_value"] is None
+    assert f["vectors"]["baseline_null_model"]["params"]["raters_qualifying"] == 1600
+    assert f["vectors"]["baseline_null_model"]["params"]["raters_used"] == 1500
+
+
+def test_l1_v3_cross_reference_none_when_vectors_disabled():
+    rows = [{"participantId": f"p{i}", "createdAtMillis": 1_700_000_000_000} for i in range(10)]
+    res = find_enrollment_cohorts(rows, min_cohort_size=10, max_rows=5,
+                                  cross_handle_ids=None, lockstep_ids=None)
+    row = res["rows"][0]
+    assert row["members_in_cross_handle_map"] is None   # unknown (vector disabled), not 0
+    assert row["members_flagged_lockstep"] is None
+    res2 = find_enrollment_cohorts(rows, min_cohort_size=10, max_rows=5,
+                                   cross_handle_ids=set(), lockstep_ids=set())
+    assert res2["rows"][0]["members_in_cross_handle_map"] == 0  # known empty set -> 0
+
+
+def test_l2_note_label_pool_reflects_popularity_capped():
+    pool = _note_label_pool([("r1", "popular"), ("r2", "popular"), ("r1", "rare")], cap=10)
+    assert pool.count("popular") == 2 and pool.count("rare") == 1
+    assert set(pool) == {"popular", "rare"}
+    big = _note_label_pool([("r", "n")] * 100, cap=10)
+    assert big.count("n") == 10  # capped

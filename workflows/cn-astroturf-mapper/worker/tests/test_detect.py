@@ -5,6 +5,7 @@ from worker.workflows.cn_astroturf_mapper import (
     AstroturfMapperInput,
     _baseline_reservoir_update,
     _cap_raters,
+    _choose_baseline_raters,
     _denormalize_data,
     _omit_tweet_ids_from_result,
     _permute_note_labels,
@@ -540,3 +541,17 @@ def test_f9_unknown_rater_rows_do_not_crash_or_get_attributed_in_v5():
     row = out["rows"][0]
     assert row["shared_rater_count"] == 6
     assert None not in row["shared_raters"] and all(isinstance(p, str) for p in row["shared_raters"])
+
+
+def test_f11_baseline_raters_are_pre_bounded_before_pass_2():
+    # the rater set for the V6 pass-2 reservoirs must be chosen BEFORE the scan so peak
+    # memory is bounded by max_raters * per-rater cap, not by #target-note raters
+    raters = {f"r{i}" for i in range(100_000)}
+    chosen = _choose_baseline_raters(raters, 400, _random.Random(11))
+    assert len(chosen) == 400 and chosen <= raters
+    assert chosen == _choose_baseline_raters(raters, 400, _random.Random(11))  # deterministic seed
+    small = {"a", "b"}
+    assert _choose_baseline_raters(small, 400, _random.Random(11)) == small  # under cap: keep all
+    # _cap_raters stays as a no-op safeguard once the set is pre-bounded
+    res = {i: ["n"] for i in range(400)}
+    assert _cap_raters(res, 400, _random.Random(11)) is res

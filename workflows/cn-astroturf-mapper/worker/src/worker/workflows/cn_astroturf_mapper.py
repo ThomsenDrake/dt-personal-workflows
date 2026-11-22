@@ -1533,9 +1533,18 @@ def _baseline_reservoir_update(res: dict, seen: dict, key, item, cap: int, rng) 
             lst[j] = item
 
 
+def _choose_baseline_raters(target_raters: set, max_raters: int, rng) -> set:
+    """Seeded random sample of at most `max_raters` target-note raters to give a baseline
+    reservoir in the second pass. Chosen BEFORE the pass so peak memory is bounded by
+    max_raters * per-rater cap regardless of how many target-note raters exist."""
+    if len(target_raters) <= max_raters:
+        return set(target_raters)
+    return set(rng.sample(sorted(target_raters), max_raters))
+
+
 def _cap_raters(res: dict, max_raters: int, rng) -> dict:
-    """Keep at most `max_raters` entries (seeded random sample) so the baseline map stays
-    memory- and payload-bounded on runs with many target-note raters."""
+    """Safety net: keep at most `max_raters` entries (seeded random sample). No-op when the
+    rater set was pre-bounded by _choose_baseline_raters before the scan."""
     if len(res) <= max_raters:
         return res
     return {i: res[i] for i in rng.sample(sorted(res), max_raters)}
@@ -1599,8 +1608,9 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
 
     V6 baseline: target-note raters are known only after the first ratings pass, so a
     SECOND streamed pass over the ratings shards reservoir-samples NON-target rows whose
-    rater is a known target-note rater — up to `baseline_sample_per_rater` notes per rater
-    and at most BASELINE_MAX_RATERS raters (seeded sample). A single-pass global pool would
+    rater is in a pre-chosen seeded sample of at most BASELINE_MAX_RATERS target-note
+    raters — up to `baseline_sample_per_rater` notes per rater, with peak memory bounded
+    by BASELINE_MAX_RATERS * baseline_sample_per_rater. A single-pass global pool would
     be dominated by the ~184M non-target rows of unrelated raters and would almost never
     capture a target rater's baseline. Pass 2 is skipped when baseline_sample_per_rater=0
     (e.g. the baseline vector is disabled). Memory- and payload-bounded. The return is
@@ -1652,7 +1662,11 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
         # NON-target rows of known target-note raters (see docstring — a one-pass global pool
         # would almost never capture them on the ~184M-row table)
         if baseline_sample_per_rater > 0 and target_raters_seen:
-            logger.info("cn V6 baseline pass: re-streaming %s ratings shards, filtering on %s target-note raters", len(ratings_urls), len(target_raters_seen))
+            # choose the bounded rater set BEFORE pass 2: peak memory is then bounded by
+            # BASELINE_MAX_RATERS * baseline_sample_per_rater no matter how many target-note
+            # raters there are (capping only after the scan cannot reclaim peak memory)
+            baseline_rater_ids = _choose_baseline_raters(target_raters_seen, BASELINE_MAX_RATERS, rng)
+            logger.info("cn V6 baseline pass: re-streaming %s ratings shards, filtering on %s of %s target-note raters", len(ratings_urls), len(baseline_rater_ids), len(target_raters_seen))
             for url in ratings_urls:
                 async for row in _aiter_tsv_rows(client, url):
                     baseline_rows_scanned += 1
@@ -1660,7 +1674,7 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
                     if nid in target_note_ids:
                         continue
                     pid = _rater_pid(row)
-                    if not pid or pid not in target_raters_seen:
+                    if not pid or pid not in baseline_rater_ids:
                         continue
                     _baseline_reservoir_update(baseline_res, baseline_seen, pidx[pid], nid, baseline_sample_per_rater, rng)
         # status history

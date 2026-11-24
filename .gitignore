@@ -5,3 +5,4 @@ __pycache__/
 .uv/
 dist/
 *.egg-info/
+workflows/cn-astroturf-mapper/worker/uv.lock

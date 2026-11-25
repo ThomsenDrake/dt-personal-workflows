@@ -2746,7 +2746,9 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
     workflow_display_name="CN Astroturf Mapper",
     # phase-2 participant expansion adds up to ~2 full ratings scans (~30-40 min) on top of
     # runs that already approach the 1h default, so raise the workflow execution timeout
-    execution_timeout=timedelta(hours=3),
+    # (6h leaves headroom for slow/flaky shard downloads, which the V6 baseline pass and the
+    # two expansion passes all depend on)
+    execution_timeout=timedelta(hours=6),
     workflow_description=(
         "Maps potential X Community Notes astroturfing / coordinated-rating campaigns "
         "against given target handles, using only X's public Community Notes dataset plus "

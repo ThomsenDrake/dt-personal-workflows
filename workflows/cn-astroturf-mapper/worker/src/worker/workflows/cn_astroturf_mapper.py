@@ -950,9 +950,10 @@ def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: in
 # SEEDS and enumerates the full set of pseudonymous participantIds participating in the
 # campaign by re-streaming the already-resolved ratings shard URLs:
 #   pass A — rows whose raterParticipantId is a seed: record seed -> noteIds (reservoir cap
-#            expand_rater_note_cap) and note -> seed raters/directions; notes whose seed
-#            fan-in exceeds expand_note_fanin_cap are skipped (mega-notes would swamp the
-#            expansion with organic raters)
+#            expand_rater_note_cap; the same per-seed cap bounds the note -> seed-raters map to
+#            at most expand_seed_max x expand_rater_note_cap entries) and note -> seed
+#            raters/directions; notes whose seed fan-in exceeds expand_note_fanin_cap are
+#            skipped (mega-notes would swamp the expansion with organic raters)
 #   seed_notes = notes touched by >= 1 seed
 #   pass B — rows whose noteId is in seed_notes: count, per rater, how many seed_notes they
 #            share (with direction + same-direction matches vs the seed-majority direction)
@@ -984,7 +985,9 @@ def build_expansion_seeds(v1_flagged, v2_flagged, direction_cluster_members, coh
 
 class _ExpansionPassA:
     """Pass-A bookkeeping, one ratings row at a time (sync `update` so both the streamed
-    driver and unit tests share the exact same logic)."""
+    driver and unit tests share the exact same logic). Memory-bounded: each seed records at
+    most `rater_note_cap` notes (bounds note_agg to seed_max x rater_note_cap pairs) and notes
+    whose seed fan-in exceeds `note_fanin_cap` are dropped from seed_notes entirely."""
 
     def __init__(self, seeds, rater_note_cap: int, note_fanin_cap: int, rng):
         self.seeds = set(seeds)
@@ -1005,6 +1008,10 @@ class _ExpansionPassA:
             return
         nid = row.get("noteId")
         if not nid or nid in self.excluded:
+            return
+        if self.seed_shared.get(pid, 0) >= self.rater_note_cap:
+            # per-seed recording cap: bounds note_agg to at most seed_max x rater_note_cap
+            # (seed, note) pairs no matter how many notes a seed rated in total
             return
         agg = self.note_agg.get(nid)
         if agg is None:
@@ -2298,7 +2305,7 @@ async def load_enrollment_for_raters(participant_ids: set) -> dict:
 # ── Activity 4: coordination analytics (pure, deterministic) ──────────────────
 
 
-@workflows.activity(start_to_close_timeout=timedelta(hours=2), retry_policy_max_attempts=2)
+@workflows.activity(start_to_close_timeout=timedelta(hours=5), retry_policy_max_attempts=2)
 async def detect_coordination(targets: list, notes: list, data: dict, p: AstroturfMapperInput) -> dict:
     data = _denormalize_data(data)  # compact indexed load -> dict rows (tests may pass dict rows directly)
     tweet_to_handle = {}
@@ -2744,11 +2751,11 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
 @workflows.workflow.define(
     name="cn-astroturf-mapper",
     workflow_display_name="CN Astroturf Mapper",
-    # phase-2 participant expansion adds up to ~2 full ratings scans (~30-40 min) on top of
-    # runs that already approach the 1h default, so raise the workflow execution timeout
-    # (6h leaves headroom for slow/flaky shard downloads, which the V6 baseline pass and the
-    # two expansion passes all depend on)
-    execution_timeout=timedelta(hours=6),
+    # phase-2 participant expansion adds up to ~2 full ratings scans on top of runs that
+    # already approach the 1h default, so raise the workflow execution timeout (8h leaves
+    # headroom for slow/flaky shard downloads, which the V6 baseline pass and the two
+    # expansion passes all depend on)
+    execution_timeout=timedelta(hours=8),
     workflow_description=(
         "Maps potential X Community Notes astroturfing / coordinated-rating campaigns "
         "against given target handles, using only X's public Community Notes dataset plus "

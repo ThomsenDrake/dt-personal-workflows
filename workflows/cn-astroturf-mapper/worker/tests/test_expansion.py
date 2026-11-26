@@ -82,7 +82,21 @@ def test_pass_a_per_seed_reservoir_cap_is_bounded_and_deterministic():
                           rng=random.Random(mod.EXPANSION_RNG_SEED))
     assert len(r1["seed_note_lists"]["s1"]) == 5
     assert r1["seed_note_lists"] == r2["seed_note_lists"]  # seeded => reproducible
-    assert r1["seed_shared"]["s1"] == 50  # the shared COUNT is exact; only the stored list is capped
+    # the shared count follows the per-seed recording cap (bounded note_agg memory)
+    assert r1["seed_shared"]["s1"] == 5
+
+
+def test_pass_a_per_seed_cap_bounds_note_agg_memory():
+    # a seed rating far more notes than rater_note_cap must not grow note_agg without bound
+    rows = [_row(f"n{i}", "s1", "HELPFUL") for i in range(50)] + [_row("shared", "s2", "HELPFUL")]
+    res = expansion_pass_a(rows, {"s1", "s2"}, rater_note_cap=5, note_fanin_cap=100)
+    assert res["seed_shared"]["s1"] == 5                      # per-seed recording capped
+    assert len(res["note_agg"]) == 6                           # 5 notes of s1 + the shared one
+    assert res["seed_shared"]["s2"] == 1
+    # determinism of the capped recording under the seeded reservoir
+    again = expansion_pass_a(rows, {"s1", "s2"}, rater_note_cap=5, note_fanin_cap=100,
+                             rng=random.Random(mod.EXPANSION_RNG_SEED))
+    assert again["seed_note_lists"] == res["seed_note_lists"]
 
 
 def test_seed_note_majority_direction():

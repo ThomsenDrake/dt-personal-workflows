@@ -428,6 +428,27 @@ def test_augment_assessment_adds_paragraph_entry_and_caveat():
     assert out2["methodology_caveats"] == []
 
 
+def test_pass_b_compact_storage_matches_dict_view():
+    # pass B stores one pid->index dict + a flat int64 array (not one dict per rater) so
+    # multi-million-rater fan-out cannot OOM the worker; iter_stats must match result()
+    rows = [
+        _row("n1", "r1", "HELPFUL"), _row("n1", "r2", "NOT_HELPFUL"),
+        _row("n2", "r1", "NOT_HELPFUL"), _row("n2", "r1", "HELPFUL"),
+        _row("n9", "r3", "HELPFUL"),  # not a seed note: ignored
+    ]
+    majority = {"n1": "helpful", "n2": "not_helpful"}
+    pb = mod._ExpansionPassB({"n1", "n2"}, majority)
+    for r in rows:
+        pb.update(r)
+    assert len(pb.idx) == 2 and len(pb.stats) == 2 * pb.SLOTS
+    via_result = expansion_pass_b(rows, {"n1", "n2"}, majority)
+    assert dict(pb.iter_stats()) == via_result["rater_stats"]
+    assert via_result["rater_stats"]["r1"] == {"shared": 3, "helpful": 2, "not_helpful": 1,
+                                               "match_helpful": 1, "match_not_helpful": 1}
+    assert via_result["rater_stats"]["r2"] == {"shared": 1, "helpful": 0, "not_helpful": 1,
+                                               "match_helpful": 0, "match_not_helpful": 0}
+
+
 # ── vector builder memory bound (OOM regression) ──
 
 

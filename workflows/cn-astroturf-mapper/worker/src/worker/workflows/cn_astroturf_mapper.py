@@ -86,6 +86,7 @@ Env vars:
 """
 from __future__ import annotations
 
+import array
 import asyncio
 import bisect
 import csv
@@ -1073,14 +1074,19 @@ def expansion_seed_note_majority(note_agg: dict) -> dict:
 
 class _ExpansionPassB:
     """Pass-B bookkeeping, one ratings row at a time. Counters only (no per-rater note lists):
-    memory is O(#raters on seed notes), never O(#rows). Assumes the snapshot carries one
-    rating row per (noteId, raterParticipantId) — the same assumption the burst detector
-    makes when counting window rows."""
+    memory is O(#raters on seed notes), never O(#rows), and stored compactly — one pid->index
+    dict plus a flat int64 array of SLOTS counters per rater (shared, helpful, not_helpful,
+    match_helpful, match_not_helpful) instead of one dict per rater, so multi-million-rater
+    seed-note fan-out cannot OOM the worker. Assumes the snapshot carries one rating row per
+    (noteId, raterParticipantId) — the same assumption the burst detector makes."""
+
+    SLOTS = 5
 
     def __init__(self, seed_notes, note_majority: dict):
         self.seed_notes = set(seed_notes)
         self.note_majority = note_majority
-        self.rater_stats = {}
+        self.idx = {}
+        self.stats = array.array("q")
         self.rows_scanned = 0
 
     def update(self, row: dict) -> None:
@@ -1091,23 +1097,33 @@ class _ExpansionPassB:
         pid = _rater_pid(row)
         if not pid:
             return  # unknown-rater rows are never attributed to a participant
-        st = self.rater_stats.get(pid)
-        if st is None:
-            st = self.rater_stats[pid] = {"shared": 0, "helpful": 0, "not_helpful": 0,
-                                          "match_helpful": 0, "match_not_helpful": 0}
-        st["shared"] += 1
+        i = self.idx.get(pid)
+        if i is None:
+            i = self.idx[pid] = len(self.stats) // self.SLOTS
+            self.stats.extend((0, 0, 0, 0, 0))
+        b = i * self.SLOTS
+        s = self.stats
+        s[b] += 1
         d = _note_direction((row.get("helpfulnessLevel") or "").upper())
         if d == "helpful":
-            st["helpful"] += 1
+            s[b + 1] += 1
             if self.note_majority.get(nid) == "helpful":
-                st["match_helpful"] += 1
+                s[b + 3] += 1
         elif d == "not_helpful":
-            st["not_helpful"] += 1
+            s[b + 2] += 1
             if self.note_majority.get(nid) == "not_helpful":
-                st["match_not_helpful"] += 1
+                s[b + 4] += 1
+
+    def iter_stats(self):
+        """Yield (pid, stats dict) one rater at a time without materializing all of them."""
+        s = self.stats
+        for pid, i in self.idx.items():
+            b = i * self.SLOTS
+            yield pid, {"shared": s[b], "helpful": s[b + 1], "not_helpful": s[b + 2],
+                        "match_helpful": s[b + 3], "match_not_helpful": s[b + 4]}
 
     def result(self) -> dict:
-        return {"rater_stats": self.rater_stats, "rows_scanned": self.rows_scanned}
+        return {"rater_stats": dict(self.iter_stats()), "rows_scanned": self.rows_scanned}
 
 
 def expansion_pass_b(rows, seed_notes, note_majority: dict) -> dict:
@@ -1350,14 +1366,20 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
                 async for row in _aiter_tsv_rows(client, url):
                     rows_b += 1
                     pb.update(row)
-            res_b = pb.result()
-            raters_seen = len(res_b["rater_stats"])
+            raters_seen = len(pb.idx)
             logger.info("cn expansion pass B level=%d done: rows_scanned=%d raters_on_seed_notes=%d",
                         level, rows_b, raters_seen)
             passes.append({"level": level, "pass": "B", "shards": len(shard_urls), "rows_scanned": rows_b,
                            "raters_seen": raters_seen})
             new_participants = set()
-            for pid, st in res_b["rater_stats"].items():
+            # consume the compact index as we go (popitem) so peak memory is max(index,
+            # participants) instead of their sum
+            while pb.idx:
+                pid, i = pb.idx.popitem()
+                b = i * pb.SLOTS
+                s = pb.stats
+                st = {"shared": s[b], "helpful": s[b + 1], "not_helpful": s[b + 2],
+                      "match_helpful": s[b + 3], "match_not_helpful": s[b + 4]}
                 prev = participants.get(pid)
                 if prev is None:
                     if st["shared"] < p.expand_min_shared_notes:
@@ -1368,7 +1390,6 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
                 else:
                     st["level"] = prev["level"]
                     participants[pid] = st
-            res_b = None
             pb = None
             cur_seeds |= new_participants
     return {

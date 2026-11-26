@@ -371,6 +371,33 @@ def test_detect_wires_participant_expansion_after_other_vectors(monkeypatch):
                                           "coordination_score", "severity", "noted_tweet_ids"}
 
 
+def test_detect_trims_participant_ids_to_fit_payload_cap(monkeypatch):
+    import json
+    p, targets, notes, data = _detect_fixture()
+    p.expand_max_participants = 30000
+    many = {f"{i:064x}": {"level": 1, "shared": 2, "helpful": 2, "not_helpful": 0,
+                           "match_helpful": 2, "match_not_helpful": 0} for i in range(30000)}
+
+    async def fake(shard_urls, seed_ids, p):
+        return {
+            "seeds": sorted(seed_ids),
+            "participants": {**{pid: {"level": 0, "shared": 4, "helpful": 4, "not_helpful": 0,
+                                       "match_helpful": 4, "match_not_helpful": 0} for pid in seed_ids},
+                             **many},
+            "seed_notes": {"n1", "n2", "n3"},
+            "seed_helpful_notes": 3, "seed_not_helpful_notes": 0,
+            "levels_run": 1, "passes": [],
+        }
+
+    monkeypatch.setattr(mod, "run_participant_expansion", fake)
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    v7 = f["vectors"]["participant_expansion"]
+    assert len(json.dumps(f)) <= 1_800_000
+    assert len(v7["participant_ids"]) < 30000
+    assert v7["participant_ids_truncated_to"] == len(v7["participant_ids"])
+    assert v7["summary"]["participants_total"] == 30006  # summary counts are not trimmed
+
+
 def test_detect_marks_expansion_unavailable_when_ratings_source_unavailable():
     p, targets, notes, data = _detect_fixture()
     data.pop("ratings_source")

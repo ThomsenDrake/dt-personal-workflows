@@ -2784,7 +2784,7 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             "severity": severity,
         }
 
-    return {
+    out = {
         "per_handle": per_handle,
         "all_clusters": clusters,
         "cluster_note_ids": sorted(cluster_notes),
@@ -2796,6 +2796,18 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             for n in notes
         ],
     }
+    # Keep the activity result under the Temporal event payload cap (~2MB): the compact
+    # participant_ids list is the one field allowed to shrink (it is a cap, not a floor) —
+    # trim it deterministically until the serialized result fits.
+    vec7 = (vectors.get("participant_expansion") or {})
+    ids = vec7.get("participant_ids") or []
+    if ids and len(json.dumps(out)) > 1_800_000:
+        keep = len(ids)
+        while keep > 1000 and len(json.dumps(out)) > 1_800_000:
+            keep = max(1000, keep // 2)
+            vec7["participant_ids"] = ids[:keep]
+        vec7["participant_ids_truncated_to"] = keep
+    return out
 
 
 # ── Activity 5: LLM narrative assessment ──────────────────────────────────────

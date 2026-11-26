@@ -90,6 +90,7 @@ import asyncio
 import bisect
 import csv
 import hashlib
+import heapq
 import io
 import json
 import logging
@@ -1035,11 +1036,13 @@ class _ExpansionPassA:
             del self.note_agg[nid]
 
     def result(self) -> dict:
+        # live references (no copies): callers that keep only derived scalars/sets can drop
+        # this dict and the pass-A bookkeeping is freed before pass B starts
         return {
             "note_agg": self.note_agg,
             "seed_notes": set(self.note_agg),
-            "seed_shared": dict(self.seed_shared),
-            "seed_note_lists": {k: list(v) for k, v in self.seed_note_lists.items()},
+            "seed_shared": self.seed_shared,
+            "seed_note_lists": self.seed_note_lists,
             "rows_scanned": self.rows_scanned,
             "fanin_excluded": len(self.excluded),
         }
@@ -1153,6 +1156,24 @@ def participant_tier(score: float) -> str:
     return "low"
 
 
+def participant_score(shared: int, jac: float, n_handles: int, in_v1: bool, in_lockstep: bool,
+                      in_cohort: bool, in_burst: bool, level: int) -> tuple:
+    """Weighted participant score (PARTICIPANT_SCORE_WEIGHTS) and tier. Pure arithmetic so the
+    vector builder can score every participant in one pass without materializing row dicts."""
+    w = PARTICIPANT_SCORE_WEIGHTS
+    flag_score = (w["flag_bonus"]["in_v1"] * bool(in_v1) + w["flag_bonus"]["in_lockstep"] * bool(in_lockstep)
+                  + w["flag_bonus"]["in_cohort"] * bool(in_cohort) + w["flag_bonus"]["in_burst"] * bool(in_burst))
+    score = (
+        min(w["shared_seed_notes_cap"], w["shared_seed_notes"] * shared)
+        + w["same_direction_jaccard"] * jac
+        + min(w["handles_covered_cap"], w["handles_covered"] * n_handles)
+        + min(w["flag_bonus_cap"], flag_score)
+        + (w["seed_level0_bonus"] if level == 0 else 0.0)
+    )
+    score = round(min(100.0, score), 2)
+    return score, participant_tier(score)
+
+
 def score_participant(pid: str, st: dict, seed_helpful_notes: int, seed_not_helpful_notes: int,
                       note_handle: dict, rater_note_dir: dict, flag_sets: dict,
                       baseline_by_rater, seed_notes) -> dict:
@@ -1168,23 +1189,13 @@ def score_participant(pid: str, st: dict, seed_helpful_notes: int, seed_not_help
     in_lockstep = pid in (flag_sets.get("lockstep") or ())
     in_cohort = pid in (flag_sets.get("cohort") or ())
     in_burst = pid in (flag_sets.get("burst") or ())
-    w = PARTICIPANT_SCORE_WEIGHTS
-    flag_score = (w["flag_bonus"]["in_v1"] * bool(in_v1) + w["flag_bonus"]["in_lockstep"] * bool(in_lockstep)
-                  + w["flag_bonus"]["in_cohort"] * bool(in_cohort) + w["flag_bonus"]["in_burst"] * bool(in_burst))
-    score = (
-        min(w["shared_seed_notes_cap"], w["shared_seed_notes"] * shared)
-        + w["same_direction_jaccard"] * jac
-        + min(w["handles_covered_cap"], w["handles_covered"] * len(handles))
-        + min(w["flag_bonus_cap"], flag_score)
-        + (w["seed_level0_bonus"] if level == 0 else 0.0)
-    )
-    score = round(min(100.0, score), 2)
+    score, tier = participant_score(shared, jac, len(handles), in_v1, in_lockstep, in_cohort, in_burst, level)
     base_sample = None
     base_overlap = None
     if baseline_by_rater:
         bl = baseline_by_rater.get(pid) or []
         base_sample = len(bl)
-        base_overlap = len(set(bl) & set(seed_notes))
+        base_overlap = sum(1 for n in bl if n in seed_notes)
     return {
         "participantId": pid,  # pseudonymous ONLY — never resolve to handles
         "expansion_level": level,
@@ -1203,7 +1214,7 @@ def score_participant(pid: str, st: dict, seed_helpful_notes: int, seed_not_help
         "baseline_sample_size": base_sample,
         "baseline_seed_note_overlap": base_overlap,
         "score": score,
-        "tier": participant_tier(score),
+        "tier": tier,
     }
 
 
@@ -1227,44 +1238,68 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
                                        flag_sets: dict, baseline_by_rater, p) -> dict:
     """Assemble the participant_expansion (V7) vector from a finished expansion run.
 
-    Scores EVERY participant (seeds are expansion_level 0 and are included), rows sorted by
-    (-score, -shared_seed_notes, participantId) and capped at max_vector_rows_in_result; the
-    compact full participant_ids list is capped at expand_max_participants (keeps the result
-    under the ~2MB payload cap; ids are 64 hex chars)."""
-    max_rows = p.max_vector_rows_in_result
+    Every participant (seeds are expansion_level 0 and are included) is scored in ONE pass for
+    the summary counts, but full row dicts are only materialized for the top
+    max_vector_rows_in_result rows and the compact participant_ids list is capped at
+    expand_max_participants (ordering (-score, -shared_seed_notes, participantId); keeps the
+    result under the ~2MB payload cap, ids are 64 hex chars). Bounded heaps keep peak memory
+    O(max_rows + expand_max_participants) instead of O(#participants) row dicts."""
+    max_rows = max(0, p.max_vector_rows_in_result)
+    id_cap = max(0, int(p.expand_max_participants))
     seeds = expansion.get("seeds") or []
     participants = expansion.get("participants") or {}
     seed_notes = expansion.get("seed_notes") or set()
     seed_h = expansion.get("seed_helpful_notes") or 0
     seed_n = expansion.get("seed_not_helpful_notes") or 0
     baseline = baseline_by_rater if baseline_by_rater else None
-    rows = [
-        score_participant(pid, st, seed_h, seed_n, note_handle, rater_note_dir, flag_sets, baseline, seed_notes)
-        for pid, st in participants.items()
-    ]
-    rows.sort(key=lambda r: (-r["score"], -r["shared_seed_notes"], r["participantId"]))
     per_level = defaultdict(int)
     tiers = {"high": 0, "medium": 0, "low": 0}
-    for r in rows:
-        per_level[str(r["expansion_level"])] += 1
-        tiers[r["tier"]] += 1
+    max_handles = 0
+
+    def _scored_entries():
+        nonlocal max_handles
+        for pid, st in participants.items():
+            level = int(st.get("level", 0))
+            shared = int(st.get("shared", 0))
+            jac = same_direction_jaccard(st, seed_h, seed_n)
+            dirs = rater_note_dir.get(pid) or {}
+            n_handles = sum(1 for n in dirs if n in note_handle)
+            score, tier = participant_score(
+                shared, jac, n_handles,
+                pid in (flag_sets.get("v1") or ()), pid in (flag_sets.get("lockstep") or ()),
+                pid in (flag_sets.get("cohort") or ()), pid in (flag_sets.get("burst") or ()), level,
+            )
+            per_level[str(level)] += 1
+            tiers[tier] += 1
+            if n_handles > max_handles:
+                max_handles = n_handles
+            yield ((-score, -shared, pid), pid)
+
+    k = max(max_rows, id_cap)
+    top = heapq.nsmallest(k, _scored_entries()) if k > 0 else []
+    rows = [
+        score_participant(pid, participants[pid], seed_h, seed_n, note_handle, rater_note_dir,
+                          flag_sets, baseline, seed_notes)
+        for _, pid in top[:max_rows]
+    ]
+    participant_ids = [pid for _, pid in top[:id_cap]]
     return {
         "params": _expansion_params(p, max_rows),
         "summary": {
             "seeds": len(seeds),
             "seed_notes": len(seed_notes),
             "levels_run": expansion.get("levels_run", 0),
-            "participants_total": len(rows),
+            "participants_total": len(participants),
             "participants_per_level": {k: per_level[k] for k in sorted(per_level)},
             "tier_counts": tiers,
             "tier_high": tiers["high"],
             "tier_medium": tiers["medium"],
             "tier_low": tiers["low"],
-            "max_handles_covered": max((r["handles_covered_count"] for r in rows), default=0),
+            "max_handles_covered": max_handles,
         },
         "passes": expansion.get("passes") or [],
-        "rows": rows[:max_rows],
-        "participant_ids": [r["participantId"] for r in rows][:p.expand_max_participants],
+        "rows": rows,
+        "participant_ids": participant_ids,
     }
 
 
@@ -1300,10 +1335,13 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
             note_majority = expansion_seed_note_majority(res_a["note_agg"])
             seed_h = sum(1 for m in note_majority.values() if m == "helpful")
             seed_n = sum(1 for m in note_majority.values() if m == "not_helpful")
+            fanin_excluded = res_a["fanin_excluded"]
             logger.info("cn expansion pass A level=%d done: rows_scanned=%d seed_notes=%d fanin_excluded=%d",
-                        level, rows_a, len(seed_notes), res_a["fanin_excluded"])
+                        level, rows_a, len(seed_notes), fanin_excluded)
             passes.append({"level": level, "pass": "A", "shards": len(shard_urls), "rows_scanned": rows_a,
-                           "seed_notes": len(seed_notes), "fanin_excluded": res_a["fanin_excluded"]})
+                           "seed_notes": len(seed_notes), "fanin_excluded": fanin_excluded})
+            res_a = None
+            pa = None
             logger.info("cn expansion pass B level=%d: streaming %d ratings shards filtered on %d seed notes",
                         level, len(shard_urls), len(seed_notes))
             pb = _ExpansionPassB(seed_notes, note_majority)
@@ -1313,18 +1351,25 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
                     rows_b += 1
                     pb.update(row)
             res_b = pb.result()
+            raters_seen = len(res_b["rater_stats"])
             logger.info("cn expansion pass B level=%d done: rows_scanned=%d raters_on_seed_notes=%d",
-                        level, rows_b, len(res_b["rater_stats"]))
+                        level, rows_b, raters_seen)
             passes.append({"level": level, "pass": "B", "shards": len(shard_urls), "rows_scanned": rows_b,
-                           "raters_seen": len(res_b["rater_stats"])})
+                           "raters_seen": raters_seen})
             new_participants = set()
             for pid, st in res_b["rater_stats"].items():
                 prev = participants.get(pid)
-                if prev is None and st["shared"] < p.expand_min_shared_notes:
-                    continue  # shares too few seed notes to be a participant
-                participants[pid] = {**st, "level": prev["level"] if prev is not None else level}
                 if prev is None:
+                    if st["shared"] < p.expand_min_shared_notes:
+                        continue  # shares too few seed notes to be a participant
+                    st["level"] = level
+                    participants[pid] = st
                     new_participants.add(pid)
+                else:
+                    st["level"] = prev["level"]
+                    participants[pid] = st
+            res_b = None
+            pb = None
             cur_seeds |= new_participants
     return {
         "seeds": sorted(seed_ids),
@@ -2516,6 +2561,7 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
                     {"v1": v1_flagged_full, "lockstep": v2_flagged_full, "cohort": cohort_members, "burst": v5_shared_full},
                     data.get("baseline_by_rater"), p,
                 )
+                expansion = None
             else:
                 vectors["participant_expansion"] = {
                     "params": exp_params,

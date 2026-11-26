@@ -426,3 +426,48 @@ def test_augment_assessment_adds_paragraph_entry_and_caveat():
     assert "unavailable" in out2["overall_summary"]
     assert out2["vectors"]["participant_expansion"]["assessment"].startswith("unavailable")
     assert out2["methodology_caveats"] == []
+
+
+# ── vector builder memory bound (OOM regression) ──
+
+
+def test_vector_builder_scores_all_but_materializes_only_capped_rows(monkeypatch):
+    # pass B can surface ~1M+ raters on seed notes; the builder must score every participant
+    # for the summary in one pass but only build full row dicts for the capped top rows/ids
+    n = 5000
+    participants = {
+        f"p{i:06d}": {"level": 1, "shared": i % 50, "helpful": i % 50, "not_helpful": 0,
+                      "match_helpful": i % 50, "match_not_helpful": 0}
+        for i in range(n)
+    }
+    participants["s0"] = {"level": 0, "shared": 99, "helpful": 99, "not_helpful": 0,
+                          "match_helpful": 99, "match_not_helpful": 0}
+    expansion = {
+        "seeds": ["s0"], "participants": participants, "seed_notes": {"n1"},
+        "seed_helpful_notes": 1, "seed_not_helpful_notes": 0, "levels_run": 1, "passes": [],
+    }
+    p = AstroturfMapperInput(target_handles=["h1"], max_vector_rows_in_result=7, expand_max_participants=13)
+    calls = []
+    real = mod.score_participant
+
+    def counting(*a, **kw):
+        calls.append(a[0])
+        return real(*a, **kw)
+
+    monkeypatch.setattr(mod, "score_participant", counting)
+    vec = build_participant_expansion_vector(expansion, {}, {}, {}, None, p)
+    assert vec["summary"]["participants_total"] == n + 1          # summary covers everyone
+    assert sum(vec["summary"]["tier_counts"].values()) == n + 1
+    assert vec["summary"]["participants_per_level"] == {"0": 1, "1": n}
+    assert len(vec["rows"]) == 7 and len(calls) == 7                # only capped rows materialized
+    assert len(vec["participant_ids"]) == 13
+    assert vec["rows"][0]["participantId"] == "s0"                 # highest score first
+    assert vec["participant_ids"][0] == "s0"
+    # ids are the top expand_max_participants by (-score, -shared, participantId)
+    keys = sorted(
+        ((-mod.participant_score(st["shared"], mod.same_direction_jaccard(st, 1, 0), 0,
+                                 False, False, False, False, st["level"])[0], -st["shared"], pid), pid)
+        for pid, st in participants.items()
+    )
+    assert vec["participant_ids"] == [pid for _, pid in keys[:13]]
+    assert [r["participantId"] for r in vec["rows"]] == [pid for _, pid in keys[:7]]

@@ -1,5 +1,6 @@
 """Unit tests for the phase-2 participant-expansion (V7) pure helpers in cn_astroturf_mapper."""
 import asyncio
+import os
 import random
 
 import pytest
@@ -234,14 +235,44 @@ def test_run_participant_expansion_two_levels(monkeypatch):
 
     exp = asyncio.run(run())
     exp2 = asyncio.run(run())
-    assert exp == exp2  # deterministic
+    keys = ("seeds", "seed_notes", "seed_helpful_notes", "seed_not_helpful_notes",
+            "levels_run", "passes", "participants_count")
+    assert {k: exp[k] for k in keys} == {k: exp2[k] for k in keys}  # deterministic
+    parts = dict(mod.iter_expansion_participants(exp))
+    assert parts == dict(mod.iter_expansion_participants(exp2))
+    assert exp["participants_file"] and exp2["participants_file"]
+    os.unlink(exp["participants_file"])
+    os.unlink(exp2["participants_file"])
     assert exp["seeds"] == ["s1", "s2"]
     assert exp["levels_run"] == 2 and len(exp["passes"]) == 4  # 2 scans per level
     assert exp["seed_notes"] == {"n1", "n2", "n3"}
-    levels = {pid: st["level"] for pid, st in exp["participants"].items()}
+    levels = {pid: st["level"] for pid, st in parts.items()}
     assert levels == {"s1": 0, "s2": 0, "p1": 1, "p3": 2}  # p2 never reaches min shared notes
-    assert exp["participants"]["p1"]["shared"] == 3
+    assert parts["p1"]["shared"] == 3
     assert exp["seed_helpful_notes"] == 3 and exp["seed_not_helpful_notes"] == 0
+
+
+def test_pass_b_spill_merge_is_bounded_and_exact(tmp_path):
+    # with a tiny spill cap the spiller writes several pid-sorted files; the merge must sum
+    # counters per rater exactly (peak RAM stays O(spill cap), not O(#raters))
+    sn = {"n1", "n2"}
+    maj = {"n1": "helpful", "n2": "not_helpful"}
+    sp = mod._PassBSpill(sn, maj, spill_raters=2, tmpdir=str(tmp_path))
+    rows = [
+        _row("n1", "a", "HELPFUL"), _row("n1", "b", "HELPFUL"), _row("n2", "a", "NOT_HELPFUL"),
+        _row("n2", "a", "HELPFUL"), _row("n1", "c", "HELPFUL"), _row("n9", "z", "HELPFUL"),
+    ]
+    for r in rows:
+        sp.update(r)
+    files, _ = sp.finish()
+    assert len(files) >= 2
+    merged = dict(mod._merge_passb_files(files))
+    assert merged["a"] == [3, 2, 1, 1, 1]
+    assert merged["b"] == [1, 1, 0, 1, 0]
+    assert merged["c"] == [1, 1, 0, 1, 0]
+    assert "z" not in merged  # n9 is not a seed note
+    for f in files:
+        os.unlink(f)
 
 
 # ── detect_coordination wiring ──

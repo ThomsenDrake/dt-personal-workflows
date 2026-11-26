@@ -1134,6 +1134,111 @@ def expansion_pass_b(rows, seed_notes, note_majority: dict) -> dict:
     return pb.result()
 
 
+# Pass-B counters live in RAM for at most this many distinct raters at a time, then spill
+# pid-sorted to a temp file; the spill files are merged with heapq.merge afterwards, so peak
+# RAM stays bounded no matter how large the seed-note fan-out is.
+EXPANSION_SPILL_RATERS = 1_000_000
+
+
+class _PassBSpill:
+    """Bounded pass-B accumulation around _ExpansionPassB: when the in-RAM index reaches
+    `spill_raters` distinct raters, the counters are written pid-sorted to a temp TSV and the
+    RAM table is reset. finish() flushes the last partial chunk and returns (files, total)."""
+
+    def __init__(self, seed_notes, note_majority: dict, spill_raters: int = None, tmpdir: str = None):
+        self.seed_notes = seed_notes
+        self.note_majority = note_majority
+        self.spill_raters = spill_raters or EXPANSION_SPILL_RATERS
+        self.tmpdir = tmpdir
+        self.pb = _ExpansionPassB(seed_notes, note_majority)
+        self.files = []
+        self.spilled = 0
+
+    def update(self, row: dict) -> None:
+        self.pb.update(row)
+        if len(self.pb.idx) >= self.spill_raters:
+            self._spill()
+
+    def _spill(self) -> None:
+        if not self.pb.idx:
+            return
+        fd, path = tempfile.mkstemp(prefix="cn_passb_", suffix=".tsv", dir=self.tmpdir)
+        stats = self.pb.stats
+        with os.fdopen(fd, "w") as f:
+            for pid in sorted(self.pb.idx):
+                b = self.pb.idx[pid] * self.pb.SLOTS
+                f.write("%s\t%d\t%d\t%d\t%d\t%d\n" % (pid, stats[b], stats[b + 1], stats[b + 2], stats[b + 3], stats[b + 4]))
+        self.files.append(path)
+        self.spilled += len(self.pb.idx)
+        self.pb = _ExpansionPassB(self.seed_notes, self.note_majority)
+
+    def finish(self):
+        self._spill()
+        return self.files, self.spilled
+
+
+def _merge_passb_files(files):
+    """Merge pid-sorted pass-B spill files into (pid, summed counters list) groups."""
+    def _read(path):
+        with open(path) as f:
+            for line in f:
+                pid, c0, c1, c2, c3, c4 = line.rstrip("\n").split("\t")
+                yield pid, (int(c0), int(c1), int(c2), int(c3), int(c4))
+
+    cur_pid, cur = None, None
+    for pid, vals in heapq.merge(*(_read(p) for p in files), key=lambda t: t[0]):
+        if pid != cur_pid:
+            if cur_pid is not None:
+                yield cur_pid, cur
+            cur_pid, cur = pid, list(vals)
+        else:
+            for j in range(5):
+                cur[j] += vals[j]
+    if cur_pid is not None:
+        yield cur_pid, cur
+
+
+def _merge_participant_files(files):
+    """Merge per-level pid-sorted participant files into (pid, stats list, min level) groups:
+    a participant keeps the level at which it was FIRST discovered, with the latest stats."""
+    def _read(path):
+        with open(path) as f:
+            for line in f:
+                pid, c0, c1, c2, c3, c4, lvl = line.rstrip("\n").split("\t")
+                yield pid, (int(c0), int(c1), int(c2), int(c3), int(c4), int(lvl))
+
+    cur_pid = None
+    cur_stats = None
+    cur_lvl = 0
+    for pid, rec in heapq.merge(*(_read(p) for p in files), key=lambda t: t[0]):
+        if pid != cur_pid:
+            if cur_pid is not None:
+                yield cur_pid, cur_stats, cur_lvl
+            cur_pid, cur_stats, cur_lvl = pid, list(rec[:5]), rec[5]
+        else:
+            cur_stats = list(rec[:5])  # latest level's counters win
+            cur_lvl = min(cur_lvl, rec[5])
+    if cur_pid is not None:
+        yield cur_pid, cur_stats, cur_lvl
+
+
+def iter_expansion_participants(expansion: dict):
+    """Stream (pid, stats dict) for every participant: from the in-memory "participants" dict
+    (unit tests) or from the participants spill file written by run_participant_expansion."""
+    parts = expansion.get("participants")
+    if parts is not None:
+        yield from parts.items()
+        return
+    path = expansion.get("participants_file")
+    if not path:
+        return
+    with open(path) as f:
+        for line in f:
+            pid, sh, h, nh, mh, mnh, lvl = line.rstrip("\n").split("\t")
+            yield pid, {"shared": int(sh), "helpful": int(h), "not_helpful": int(nh),
+                        "match_helpful": int(mh), "match_not_helpful": int(mnh), "level": int(lvl)}
+
+
 def same_direction_jaccard(stats: dict, seed_helpful_notes: int, seed_not_helpful_notes: int) -> float:
     """Same-direction Jaccard of one participant vs the aggregate seed set: per direction d,
     |p_d ∩ seed_d| / |p_d ∪ seed_d| where seed_d = seed-majority-d notes; returns the max
@@ -1263,7 +1368,6 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
     max_rows = max(0, p.max_vector_rows_in_result)
     id_cap = max(0, int(p.expand_max_participants))
     seeds = expansion.get("seeds") or []
-    participants = expansion.get("participants") or {}
     seed_notes = expansion.get("seed_notes") or set()
     seed_h = expansion.get("seed_helpful_notes") or 0
     seed_n = expansion.get("seed_not_helpful_notes") or 0
@@ -1271,10 +1375,12 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
     per_level = defaultdict(int)
     tiers = {"high": 0, "medium": 0, "low": 0}
     max_handles = 0
+    total = 0
 
     def _scored_entries():
-        nonlocal max_handles
-        for pid, st in participants.items():
+        nonlocal max_handles, total
+        for pid, st in iter_expansion_participants(expansion):
+            total += 1
             level = int(st.get("level", 0))
             shared = int(st.get("shared", 0))
             jac = same_direction_jaccard(st, seed_h, seed_n)
@@ -1289,34 +1395,42 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
             tiers[tier] += 1
             if n_handles > max_handles:
                 max_handles = n_handles
-            yield ((-score, -shared, pid), pid)
+            yield ((-score, -shared, pid), pid, st)
 
-    k = max(max_rows, id_cap)
-    top = heapq.nsmallest(k, _scored_entries()) if k > 0 else []
-    rows = [
-        score_participant(pid, participants[pid], seed_h, seed_n, note_handle, rater_note_dir,
-                          flag_sets, baseline, seed_notes)
-        for _, pid in top[:max_rows]
-    ]
-    participant_ids = [pid for _, pid in top[:id_cap]]
-    return {
-        "params": _expansion_params(p, max_rows),
-        "summary": {
-            "seeds": len(seeds),
-            "seed_notes": len(seed_notes),
-            "levels_run": expansion.get("levels_run", 0),
-            "participants_total": len(participants),
-            "participants_per_level": {k: per_level[k] for k in sorted(per_level)},
-            "tier_counts": tiers,
-            "tier_high": tiers["high"],
-            "tier_medium": tiers["medium"],
-            "tier_low": tiers["low"],
-            "max_handles_covered": max_handles,
-        },
-        "passes": expansion.get("passes") or [],
-        "rows": rows,
-        "participant_ids": participant_ids,
-    }
+    pfile = expansion.get("participants_file")
+    try:
+        k = max(max_rows, id_cap)
+        top = heapq.nsmallest(k, _scored_entries()) if k > 0 else []
+        rows = [
+            score_participant(pid, st, seed_h, seed_n, note_handle, rater_note_dir,
+                              flag_sets, baseline, seed_notes)
+            for _, pid, st in top[:max_rows]
+        ]
+        participant_ids = [pid for _, pid, _ in top[:id_cap]]
+        return {
+            "params": _expansion_params(p, max_rows),
+            "summary": {
+                "seeds": len(seeds),
+                "seed_notes": len(seed_notes),
+                "levels_run": expansion.get("levels_run", 0),
+                "participants_total": total,
+                "participants_per_level": {k: per_level[k] for k in sorted(per_level)},
+                "tier_counts": tiers,
+                "tier_high": tiers["high"],
+                "tier_medium": tiers["medium"],
+                "tier_low": tiers["low"],
+                "max_handles_covered": max_handles,
+            },
+            "passes": expansion.get("passes") or [],
+            "rows": rows,
+            "participant_ids": participant_ids,
+        }
+    finally:
+        if pfile:
+            try:
+                os.unlink(pfile)
+            except OSError:
+                pass
 
 
 async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict:
@@ -1329,13 +1443,11 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
     rng = random.Random(EXPANSION_RNG_SEED)
     levels = max(1, int(p.expand_levels))
     cur_seeds = set(seed_ids)
-    participants = {
-        pid: {"level": 0, "shared": 0, "helpful": 0, "not_helpful": 0, "match_helpful": 0, "match_not_helpful": 0}
-        for pid in cur_seeds
-    }
     passes = []
     seed_notes = set()
     seed_h = seed_n = 0
+    level_files = []
+    discovery = {}  # pid -> first discovery level, only for re-seeded participants (bounded by expand_seed_max)
     async with httpx.AsyncClient(timeout=120.0) as client:
         for level in range(1, levels + 1):
             logger.info("cn expansion pass A level=%d: streaming %d ratings shards filtered on %d seed raters",
@@ -1360,41 +1472,72 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
             pa = None
             logger.info("cn expansion pass B level=%d: streaming %d ratings shards filtered on %d seed notes",
                         level, len(shard_urls), len(seed_notes))
-            pb = _ExpansionPassB(seed_notes, note_majority)
+            spiller = _PassBSpill(seed_notes, note_majority)
             rows_b = 0
             for url in shard_urls:
                 async for row in _aiter_tsv_rows(client, url):
                     rows_b += 1
-                    pb.update(row)
-            raters_seen = len(pb.idx)
-            logger.info("cn expansion pass B level=%d done: rows_scanned=%d raters_on_seed_notes=%d",
-                        level, rows_b, raters_seen)
+                    spiller.update(row)
+            spill_files, _ = spiller.finish()
+            seed_set = set(cur_seeds)
+            fd, ppath = tempfile.mkstemp(prefix="cn_participants_", suffix=".tsv")
+            level_files.append(ppath)
+            count = 0
+            distinct = 0
+            seen_seeds = set()
+            next_seed_list = []
+            next_seen = 0
+            with os.fdopen(fd, "w") as out:
+                for pid, tot in _merge_passb_files(spill_files):
+                    distinct += 1
+                    if pid in seed_set:
+                        lvl = discovery.get(pid, 0)
+                        seen_seeds.add(pid)
+                    else:
+                        if tot[0] < p.expand_min_shared_notes:
+                            continue  # shares too few seed notes to be a participant
+                        lvl = level
+                        if level < levels:
+                            next_seen += 1
+                            if len(next_seed_list) < p.expand_seed_max:
+                                next_seed_list.append(pid)
+                            else:
+                                j = rng.randrange(next_seen)
+                                if j < p.expand_seed_max:
+                                    next_seed_list[j] = pid
+                    out.write("%s\t%d\t%d\t%d\t%d\t%d\t%d\n" % (pid, tot[0], tot[1], tot[2], tot[3], tot[4], lvl))
+                    count += 1
+                for pid in sorted(seed_set - seen_seeds):
+                    out.write("%s\t0\t0\t0\t0\t0\t0\n" % pid)
+                    count += 1
+            for fp in spill_files:
+                try:
+                    os.unlink(fp)
+                except OSError:
+                    pass
+            logger.info("cn expansion pass B level=%d done: rows_scanned=%d raters_on_seed_notes=%d participants=%d",
+                        level, rows_b, distinct, count)
             passes.append({"level": level, "pass": "B", "shards": len(shard_urls), "rows_scanned": rows_b,
-                           "raters_seen": raters_seen})
-            new_participants = set()
-            # consume the compact index as we go (popitem) so peak memory is max(index,
-            # participants) instead of their sum
-            while pb.idx:
-                pid, i = pb.idx.popitem()
-                b = i * pb.SLOTS
-                s = pb.stats
-                st = {"shared": s[b], "helpful": s[b + 1], "not_helpful": s[b + 2],
-                      "match_helpful": s[b + 3], "match_not_helpful": s[b + 4]}
-                prev = participants.get(pid)
-                if prev is None:
-                    if st["shared"] < p.expand_min_shared_notes:
-                        continue  # shares too few seed notes to be a participant
-                    st["level"] = level
-                    participants[pid] = st
-                    new_participants.add(pid)
-                else:
-                    st["level"] = prev["level"]
-                    participants[pid] = st
-            pb = None
-            cur_seeds |= new_participants
+                           "raters_seen": distinct, "participants": count})
+            if level < levels:
+                for pid in next_seed_list:
+                    discovery[pid] = level
+            cur_seeds = seed_set | set(next_seed_list)
+    fd, participants_file = tempfile.mkstemp(prefix="cn_participants_", suffix=".tsv")
+    participants_count = 0
+    with os.fdopen(fd, "w") as out:
+        for pid, tot, lvl in _merge_participant_files(level_files):
+            out.write("%s\t%d\t%d\t%d\t%d\t%d\t%d\n" % (pid, tot[0], tot[1], tot[2], tot[3], tot[4], lvl))
+            participants_count += 1
+    for fp in level_files:
+        try:
+            os.unlink(fp)
+        except OSError:
+            pass
     return {
         "seeds": sorted(seed_ids),
-        "participants": participants,
+        "participants_file": participants_file,
+        "participants_count": participants_count,
         "seed_notes": seed_notes,
         "seed_helpful_notes": seed_h,
         "seed_not_helpful_notes": seed_n,

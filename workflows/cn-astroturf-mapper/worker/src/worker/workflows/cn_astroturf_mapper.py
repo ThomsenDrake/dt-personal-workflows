@@ -1136,8 +1136,8 @@ def expansion_pass_b(rows, seed_notes, note_majority: dict) -> dict:
 
 # Pass-B counters live in RAM for at most this many distinct raters at a time, then spill
 # pid-sorted to a temp file; the spill files are merged with heapq.merge afterwards, so peak
-# RAM stays bounded no matter how large the seed-note fan-out is.
-EXPANSION_SPILL_RATERS = 1_000_000
+# RAM stays bounded (~40MB per chunk) no matter how large the seed-note fan-out is.
+EXPANSION_SPILL_RATERS = 200_000
 
 
 class _PassBSpill:

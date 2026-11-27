@@ -130,20 +130,32 @@ def assign_voices(
             f"{len(overflow)} character(s) beyond the {max_characters}-voice cap fold into the narrator: {names}{more}"
         )
 
+    # Overrides are applied FIRST so they always win over auto-assignment and
+    # their voices are excluded from the auto pool (no two characters share a voice).
     used: set[str] = {narrator_voice}
-    cast: list[dict] = [narrator_entry]
+    override_voice: dict[str, str] = {}
     for ch in voiced:
         name = ch["name"]
-        override = overrides.pop(name.lower(), None)
+        ov = overrides.pop(name.lower(), None)
         if name in remaining_overrides:
             remaining_overrides.pop(name)
         else:
             remaining_overrides.pop(name.lower(), None)
-        if override:
-            if override not in catalog_by_id:
-                warnings.append(f"voice override {override!r} for {name!r} is not in the built-in catalog; passed through as-is")
-            voice_id = override
-        else:
+        if not ov:
+            continue
+        if ov in used or ov in override_voice.values():
+            warnings.append(f"voice override {ov!r} for {name!r} collides with another assignment; auto-assigning {name!r} instead")
+            continue
+        if ov not in catalog_by_id:
+            warnings.append(f"voice override {ov!r} for {name!r} is not in the built-in catalog; passed through as-is")
+        override_voice[name] = ov
+        used.add(ov)
+
+    cast: list[dict] = [narrator_entry]
+    for ch in voiced:
+        name = ch["name"]
+        voice_id = override_voice.get(name)
+        if not voice_id:
             gender = (ch.get("gender") or "").lower()
             candidates = [v for v in catalog if v["voice_id"] not in used]
             preferred = [v for v in candidates if gender and v["gender"] == gender]

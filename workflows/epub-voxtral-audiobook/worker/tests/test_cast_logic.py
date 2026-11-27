@@ -64,6 +64,29 @@ def test_assign_voices_overrides_win_and_unknown_warns():
     assert any("Ghost" in w for w in warnings)
 
 
+def test_override_voice_not_stolen_by_earlier_auto_assignment():
+    chars = [
+        {"name": "Mom", "gender": "female", "mentions": 50},
+        {"name": "Alice", "gender": "female", "mentions": 2},
+    ]
+    cast, _ = cl.assign_voices(chars, voice_overrides={"Alice": "voice_447"})
+    by_name = {c["name"]: c for c in cast}
+    assert by_name["Alice"]["voice_id"] == "voice_447"
+    assert by_name["Mom"]["voice_id"] != "voice_447"
+    assert len({c["voice_id"] for c in cast}) == len(cast)
+
+
+def test_conflicting_overrides_warn_and_stay_distinct():
+    chars = [
+        {"name": "A", "gender": "", "mentions": 10},
+        {"name": "B", "gender": "", "mentions": 5},
+    ]
+    cast, warnings = cl.assign_voices(chars, voice_overrides={"A": "voice_447", "B": "voice_447"})
+    voice_ids = [c["voice_id"] for c in cast]
+    assert len(set(voice_ids)) == len(voice_ids)
+    assert any("collides" in w for w in warnings)
+
+
 def test_parse_json_object_tolerates_fences_and_prose():
     assert cl.parse_json_object('```json\n{"a": 1}\n```') == {"a": 1}
     assert cl.parse_json_object('Here you go: {"b": [2, 3]} hope that helps') == {"b": [2, 3]}

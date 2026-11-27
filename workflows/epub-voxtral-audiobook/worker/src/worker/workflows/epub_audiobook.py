@@ -47,7 +47,6 @@ import base64
 import json
 import logging
 import os
-import re
 import subprocess
 import tempfile
 from datetime import timedelta
@@ -452,7 +451,6 @@ async def synthesize_chapter(
         "segments": len(segments),
         "duration_seconds": duration,
         "files": [f.model_dump() for f in files],
-        "local_parts": [str(p) for p in parts],
         "warnings": [],
     }
 
@@ -460,15 +458,26 @@ async def synthesize_chapter(
 @workflows.activity(start_to_close_timeout=timedelta(hours=1), retry_policy_max_attempts=1)
 async def build_merged(
     book_title: str,
-    local_parts: list[str],
+    chapter_parts: list[list[str]],
     max_merged_bytes: int,
     folder_id: str,
     gdrive: ConnectorClient = Depends(gdrive),
 ) -> dict:
+    # Re-download the uploaded chapter parts from Drive and concat them: activities
+    # may run on different worker pods, so local files from synthesize_chapter are
+    # not reliable. chapter_parts is the per-chapter ordered list of Drive file IDs.
     workdir = Path(tempfile.mkdtemp(prefix="epub-merged-"))
-    paths = [Path(p) for p in local_parts if p and os.path.exists(p)]
+    paths: list[Path] = []
+    for chapter in chapter_parts:
+        for file_id in chapter:
+            if not file_id:
+                continue
+            data = await _drive_download(gdrive, file_id)
+            p = workdir / f"part-{len(paths):05d}.mp3"
+            p.write_bytes(data)
+            paths.append(p)
     if not paths:
-        return {"file": None, "warning": "chapter audio not on local disk; merged file skipped"}
+        return {"file": None, "warning": "no chapter audio found in Drive; merged file skipped"}
     merged = workdir / f"{_safe_name(book_title)}-merged.mp3"
     _concat(paths, merged, workdir)
     size = merged.stat().st_size
@@ -575,8 +584,8 @@ class EpubVoxtralAudiobook:
         self.steps["synthesize"] = "done"
 
         self.steps["merge"] = "running"
-        local_parts = [part for cr in chapter_results for part in cr["local_parts"]]
-        merged = await build_merged(book["title"], local_parts, p.max_merged_bytes, folder_id)
+        chapter_parts = [[f["id"] for f in cr["files"]] for cr in chapter_results]
+        merged = await build_merged(book["title"], chapter_parts, p.max_merged_bytes, folder_id)
         if merged.get("warning"):
             warnings.append(merged["warning"])
         self.steps["merge"] = "done"
@@ -597,9 +606,7 @@ class EpubVoxtralAudiobook:
             "tts_model": p.tts_model,
             "script_model": p.script_model,
             "response_format": p.response_format,
-            "chapters": [
-                {k: v for k, v in cr.items() if k != "local_parts"} for cr in chapter_results
-            ],
+            "chapters": [dict(cr) for cr in chapter_results],
             "merged_file": merged.get("file"),
             "stats": {
                 "chapters": len(chapters),
@@ -626,7 +633,7 @@ class EpubVoxtralAudiobook:
             epub_file_id=p.epub_file_id,
             output_folder_id=folder_id,
             cast=[CastMember(**c) for c in cast],
-            chapters=[ChapterResult(**{k: v for k, v in cr.items() if k != "local_parts"}) for cr in chapter_results],
+            chapters=[ChapterResult(**cr) for cr in chapter_results],
             files=all_files,
             merged_file=DriveFile(**merged["file"]) if merged.get("file") else None,
             script_file=DriveFile(**script_file),

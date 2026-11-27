@@ -1,0 +1,7 @@
+{
+  "epub_file_id": "PUT_GOOGLE_DRIVE_FILE_ID_HERE",
+  "narrator_voice": "voice_478",
+  "max_characters": 8,
+  "script_model": "mistral-large-latest",
+  "tts_model": "voxtral-mini-tts-3-0"
+}

@@ -1,0 +1,15 @@
+# Managed-deployment image for the epub-voxtral-audiobook worker.
+# Build context = repository root. The platform injects the service-account
+# token (MISTRAL_SA_TOKEN_PATH) and connection settings at runtime, so no API
+# key lives in the image. The workflow is on_behalf_of=True, so the deployment
+# MUST be created hardened (deploy_workflow_deployment hardened=true).
+FROM python:3.12-slim
+WORKDIR /app
+# ffmpeg/ffprobe: concat + segment the per-chunk MP3s into chapter/merged files.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY workflows/epub-voxtral-audiobook/worker/pyproject.toml ./pyproject.toml
+COPY workflows/epub-voxtral-audiobook/worker/src ./src
+RUN pip install --no-cache-dir .
+ENV PYTHONPATH=/app/src
+CMD ["python", "-m", "worker.entrypoints.worker"]

@@ -8,6 +8,7 @@ Monorepo for my personal [Mistral Workflows](https://docs.mistral.ai/studio/work
 | --- | --- | --- | --- |
 | [workflows/ncaa-d1-best-line](workflows/ncaa-d1-best-line/README.md) | `ncaa-d1-best-line` | `crb-workflow-worker` | NCAA D1 (FBS) best-line finder: live ESPN odds ingestion, line shopping across books, edge/EV vs model projections, fractional-Kelly staking, Markdown report |
 | [workflows/cn-astroturf-mapper](workflows/cn-astroturf-mapper/README.md) | `cn-astroturf-mapper` | `cn-astroturf-mapper-worker` | Maps potential X Community Notes astroturfing / coordinated-rating campaigns against given target handles — public CN dataset + x.md, pseudonymous participant IDs only |
+| [workflows/epub-voxtral-audiobook](workflows/epub-voxtral-audiobook/README.md) | `epub-voxtral-audiobook` | `epub-audiobook-worker` (hardened) | Turns a .epub from Google Drive into a multi-character casted Voxtral audiobook: full-book character scan, per-voice TTS, chapter + merged MP3s, cast script and manifest uploaded back to Drive (OBO via the caller's google_drive_mcp credential) |
 
 ## Layout
 

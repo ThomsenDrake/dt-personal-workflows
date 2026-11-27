@@ -73,11 +73,11 @@ logger = logging.getLogger(__name__)
 gdrive = connector("google_drive_mcp")
 
 _FOLDER_MIME = "application/vnd.google-apps.folder"
-_SAFE_TITLE = re.compile(r"[^\w\-.() ]+")
 
 
 def _safe_name(name: str) -> str:
-    cleaned = _SAFE_TITLE.sub("_", name).strip().strip(".")
+    # Pure-python (no re/os): also safe to call from workflow code under enforce_determinism.
+    cleaned = "".join(c if (c.isalnum() or c in "-_.() ") else "_" for c in name).strip().strip(".")
     return cleaned[:120] or "audiobook"
 
 
@@ -252,6 +252,17 @@ def _split_if_needed(path: Path, max_part_bytes: int, workdir: Path) -> list[Pat
 
 
 # ── Activities ────────────────────────────────────────────────────────────────
+
+
+@workflows.activity(start_to_close_timeout=timedelta(minutes=1), retry_policy_max_attempts=1)
+async def prepare_run_dir() -> str:
+    # os/uuid/tempfile are not accessible from workflow code (enforce_determinism);
+    # build the scratch dir here and pass the path to the other activities.
+    import uuid
+
+    run_dir = os.path.join(tempfile.gettempdir(), f"epub-audiobook-{uuid.uuid4().hex[:12]}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=5), retry_policy_max_attempts=2)
@@ -492,10 +503,8 @@ class EpubVoxtralAudiobook:
 
     @workflows.workflow.entrypoint
     async def run(self, payload: EpubAudiobookInput) -> EpubAudiobookOutput:
-        import uuid
-
         p = payload
-        run_dir = os.path.join(tempfile.gettempdir(), f"epub-audiobook-{uuid.uuid4().hex[:12]}")
+        run_dir = await prepare_run_dir()
         warnings: list[str] = []
 
         self.steps["fetch"] = "running"

@@ -185,17 +185,39 @@ def _drive_file(res: dict, name: str) -> DriveFile:
 # ── Mistral API helpers (worker service account) ─────────────────────────────
 
 
-async def _chat_json(model: str, prompt: str) -> dict:
-    client = get_mistral_client()
-    resp = await client.chat.complete_async(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-    )
-    content = resp.choices[0].message.content
+def _content_to_str(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
     if isinstance(content, list):
-        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-    return cast_logic.parse_json_object(content)
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                parts.append(p.get("text") or "")
+            else:
+                parts.append(getattr(p, "text", "") or "")
+        return "".join(parts)
+    return str(content)
+
+
+async def _chat_json(model: str, prompt: str, attempts: int = 3) -> dict:
+    client = get_mistral_client()
+    last_raw = ""
+    for _ in range(attempts):
+        resp = await client.chat.complete_async(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        content = _content_to_str(resp.choices[0].message.content)
+        last_raw = content
+        if content.strip():
+            return cast_logic.parse_json_object(content)
+        logger.warning("empty chat content from %s; retrying", model)
+    raise ValueError(f"empty LLM response from {model} after {attempts} attempts (raw head: {last_raw[:200]!r})")
 
 
 async def _tts_chunk(model: str, voice_id: str, text: str, response_format: str) -> bytes:

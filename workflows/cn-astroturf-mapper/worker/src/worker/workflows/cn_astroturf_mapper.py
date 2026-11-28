@@ -92,6 +92,7 @@ import bisect
 import csv
 import hashlib
 import heapq
+import inspect
 import io
 import json
 import logging
@@ -3103,22 +3104,31 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
 # ── Workflow ──────────────────────────────────────────────────────────────────
 
 
-@workflows.workflow.define(
-    name="cn-astroturf-mapper",
-    workflow_display_name="CN Astroturf Mapper",
+# mistralai-workflows 4.x removed the workflow_display_name / workflow_description kwargs
+# from workflow.define (the managed image installs the latest >=3.10 at build time), so pass
+# them only when the installed SDK accepts them — keeps the module importable on 3.x and 4.x
+_WF_DEFINE_PARAMS = set(inspect.signature(workflows.workflow.define).parameters)
+_WF_DEFINE_KWARGS = {
+    "name": "cn-astroturf-mapper",
     # phase-2 participant expansion adds up to ~2 full ratings scans on top of runs that
     # already approach the 1h default, so raise the workflow execution timeout (8h leaves
     # headroom for slow/flaky shard downloads, which the V6 baseline pass and the two
     # expansion passes all depend on)
-    execution_timeout=timedelta(hours=8),
-    workflow_description=(
+    "execution_timeout": timedelta(hours=8),
+}
+if "workflow_display_name" in _WF_DEFINE_PARAMS:
+    _WF_DEFINE_KWARGS["workflow_display_name"] = "CN Astroturf Mapper"
+if "workflow_description" in _WF_DEFINE_PARAMS:
+    _WF_DEFINE_KWARGS["workflow_description"] = (
         "Maps potential X Community Notes astroturfing / coordinated-rating campaigns "
         "against given target handles, using only X's public Community Notes dataset plus "
         "the read-only x.md mirror. Reports coordination clusters of pseudonymous "
         "participant IDs only - never resolved to accounts. Findings are hypotheses for "
         "human review, not proof of a campaign."
-    ),
-)
+    )
+
+
+@workflows.workflow.define(**_WF_DEFINE_KWARGS)
 class CnAstroturfMapper(workflows.InteractiveWorkflow):
     def __init__(self):
         super().__init__()  # InteractiveWorkflow: _pending_inputs / _pending_wait_count (needed by wait_for_input)

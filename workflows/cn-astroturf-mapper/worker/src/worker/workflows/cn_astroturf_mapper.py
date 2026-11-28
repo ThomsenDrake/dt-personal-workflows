@@ -170,7 +170,7 @@ class AstroturfMapperInput(BaseModel):
     expand_levels: int = 1                     # expansion levels; each level costs 2 full ratings scans
     expand_seed_max: int = 5000                # cap on the seed set (seeded sample when larger)
     expand_rater_note_cap: int = 500           # reservoir cap on notes recorded per seed rater (pass A)
-    expand_note_fanin_cap: int = 5000          # notes whose seed fan-in exceeds this are skipped (mega-notes)
+    expand_note_fanin_cap: int = 5000          # notes whose TOTAL rater fan-in exceeds this are skipped (mega-notes)
     expand_min_shared_notes: int = 2           # rater must share >= this many seed notes to become a participant
     expand_max_participants: int = 20000       # cap on the emitted participant_ids list (payload cap)
 
@@ -951,14 +951,17 @@ def permutation_null(rater_notes: dict, min_overlap: float, min_cluster_size: in
 # V3 cohorts, V5 shared burst raters, co-rating clusters). Phase 2 uses those flagged ids as
 # SEEDS and enumerates the full set of pseudonymous participantIds participating in the
 # campaign by re-streaming the already-resolved ratings shard URLs:
-#   pass A — rows whose raterParticipantId is a seed: record seed -> noteIds (reservoir cap
-#            expand_rater_note_cap; the same per-seed cap bounds the note -> seed-raters map to
-#            at most expand_seed_max x expand_rater_note_cap entries) and note -> seed
-#            raters/directions; notes whose seed fan-in exceeds expand_note_fanin_cap are
-#            skipped (mega-notes would swamp the expansion with organic raters)
-#   seed_notes = notes touched by >= 1 seed
-#   pass B — rows whose noteId is in seed_notes: count, per rater, how many seed_notes they
-#            share (with direction + same-direction matches vs the seed-majority direction)
+#   pass A — rows whose raterParticipantId is a seed: record seed -> (noteId, direction)
+#            as a seeded reservoir of at most expand_rater_note_cap pairs per seed (evicting
+#            a pair rolls it out of the note map, so the note -> seed-raters map is bounded
+#            by expand_seed_max x expand_rater_note_cap entries no matter how many notes a
+#            seed rated) and note -> seed raters/directions; notes whose TOTAL rater fan-in
+#            exceeds expand_note_fanin_cap are dropped when their row block ends (mega-notes
+#            would swamp the expansion with organic raters)
+#   seed_notes = notes touched by >= 1 seed and not mega-excluded
+#   pass B — rows whose noteId is in seed_notes: count, per rater, how many DISTINCT seed
+#            notes they share (duplicate (noteId, rater) rows counted once) with direction +
+#            same-direction matches vs the seed-majority direction
 #   raters with shared >= expand_min_shared_notes become level-1 participants; with
 #   expand_levels > 1 the passes repeat with seeds = seeds + level-1 participants (each
 #   level costs 2 full ratings scans). All sampling is seeded/deterministic; the ratings
@@ -987,9 +990,16 @@ def build_expansion_seeds(v1_flagged, v2_flagged, direction_cluster_members, coh
 
 class _ExpansionPassA:
     """Pass-A bookkeeping, one ratings row at a time (sync `update` so both the streamed
-    driver and unit tests share the exact same logic). Memory-bounded: each seed records at
-    most `rater_note_cap` notes (bounds note_agg to seed_max x rater_note_cap pairs) and notes
-    whose seed fan-in exceeds `note_fanin_cap` are dropped from seed_notes entirely."""
+    driver and unit tests share the exact same logic).
+
+    Memory-bounded by config, not by the data: each seed records at most `rater_note_cap`
+    (note, direction) pairs in a seeded reservoir (an evicted pair is rolled out of
+    `note_agg`), so `note_agg` holds at most seed_max x rater_note_cap entries no matter how
+    many notes the seeds rated in total. Notes whose TOTAL rater fan-in exceeds
+    `note_fanin_cap` are dropped from seed_notes when their row block ends (the shards
+    stream noteId-sorted, so a note's rows are contiguous) — this is what keeps viral
+    mega-notes from swamping pass B with organic raters, and it can actually fire because
+    total fan-in is not bounded by the seed-set cap."""
 
     def __init__(self, seeds, rater_note_cap: int, note_fanin_cap: int, rng):
         self.seeds = set(seeds)
@@ -997,46 +1007,97 @@ class _ExpansionPassA:
         self.note_fanin_cap = note_fanin_cap
         self.rng = rng
         self.note_agg = {}     # noteId -> {"raters": set, "helpful": int, "not_helpful": int}
-        self.excluded = set()  # notes whose seed fan-in exceeded the cap
-        self.seed_shared = {}  # seed -> #distinct (non-excluded) seed notes
-        self.seed_note_lists = {}  # seed -> reservoir-capped noteId list
-        self.seed_seen = {}
+        self.excluded = set()  # notes whose TOTAL fan-in exceeded the cap (mega-notes)
+        self.seed_shared = {}  # seed -> #distinct recorded, non-excluded seed notes
+        self.seed_note_lists = {}  # seed -> reservoir-capped list of (noteId, direction)
+        self.seed_seen = {}    # seed -> #rows seen for that seed (reservoir draw denominator)
         self.rows_scanned = 0
+        self._cur_nid = None   # rows stream noteId-sorted: total fan-in is counted per block
+        self._cur_total = 0
 
     def update(self, row: dict) -> None:
         self.rows_scanned += 1
-        pid = _rater_pid(row)
-        if not pid or pid not in self.seeds:
-            return
         nid = row.get("noteId")
-        if not nid or nid in self.excluded:
+        if nid != self._cur_nid:
+            # the shards stream noteId-sorted: a note's row block ends when the id changes
+            self._close_note(self._cur_nid, self._cur_total)
+            self._cur_nid = nid
+            self._cur_total = 0
+        if nid:
+            self._cur_total += 1
+        pid = _rater_pid(row)
+        if not pid or pid not in self.seeds or not nid or nid in self.excluded:
             return
-        if self.seed_shared.get(pid, 0) >= self.rater_note_cap:
-            # per-seed recording cap: bounds note_agg to at most seed_max x rater_note_cap
-            # (seed, note) pairs no matter how many notes a seed rated in total
-            return
+        agg = self.note_agg.get(nid)
+        if agg is not None and pid in agg["raters"]:
+            return  # duplicate (seed, note) row: counted once
+        d = _note_direction((row.get("helpfulnessLevel") or "").upper())
+        # seeded reservoir over the seed's (note, direction) pairs: once the cap is full every
+        # further row still draws (j = rng.randrange(seen)), so the recorded sample stays
+        # uniform over ALL of the seed's notes instead of a stream-order prefix; the evicted
+        # pair is rolled out of note_agg, which is what keeps the aggregate bounded by
+        # seed_max x rater_note_cap pairs
+        seen = self.seed_seen.get(pid, 0) + 1
+        self.seed_seen[pid] = seen
+        lst = self.seed_note_lists.setdefault(pid, [])
+        if len(lst) < self.rater_note_cap:
+            lst.append((nid, d))
+        else:
+            j = self.rng.randrange(seen)
+            if j >= self.rater_note_cap:
+                return  # not selected by the reservoir: this pair is not recorded
+            old_nid, old_d = lst[j]
+            lst[j] = (nid, d)
+            self._remove_pair(old_nid, old_d, pid)
         agg = self.note_agg.get(nid)
         if agg is None:
             agg = self.note_agg[nid] = {"raters": set(), "helpful": 0, "not_helpful": 0}
-        if pid in agg["raters"]:
-            return
         agg["raters"].add(pid)
         self.seed_shared[pid] = self.seed_shared.get(pid, 0) + 1
-        _baseline_reservoir_update(self.seed_note_lists, self.seed_seen, pid, nid, self.rater_note_cap, self.rng)
-        d = _note_direction((row.get("helpfulnessLevel") or "").upper())
         if d == "helpful":
             agg["helpful"] += 1
         elif d == "not_helpful":
             agg["not_helpful"] += 1
-        if len(agg["raters"]) > self.note_fanin_cap:
-            # mega-note: too many seed raters — drop it from seed_notes entirely
+
+    def _remove_pair(self, nid, d, pid) -> None:
+        """Roll an evicted (note, seed) pair out of note_agg (reservoir eviction)."""
+        agg = self.note_agg.get(nid)
+        if agg is not None:
+            agg["raters"].discard(pid)
+            if d == "helpful" and agg["helpful"] > 0:
+                agg["helpful"] -= 1
+            elif d == "not_helpful" and agg["not_helpful"] > 0:
+                agg["not_helpful"] -= 1
+            if not agg["raters"]:
+                del self.note_agg[nid]
+        if self.seed_shared.get(pid, 0) > 0:
+            self.seed_shared[pid] -= 1
+
+    def _close_note(self, nid, total: int) -> None:
+        """End of a note's row block: apply the mega-note guard on TOTAL fan-in (not just
+        seed fan-in), so the exclusion can actually fire with a seed-capped seed set."""
+        if nid is None:
+            return
+        agg = self.note_agg.get(nid)
+        if agg is not None and total > self.note_fanin_cap:
             self.excluded.add(nid)
+            del self.note_agg[nid]
             for q in agg["raters"]:
                 if self.seed_shared.get(q, 0) > 0:
                     self.seed_shared[q] -= 1
-            del self.note_agg[nid]
+                lst = self.seed_note_lists.get(q)
+                if lst:
+                    for i, (n, _d) in enumerate(lst):
+                        if n == nid:
+                            del lst[i]
+                            break
 
     def result(self) -> dict:
+        # close the last note's row block (mega-note guard) before handing out live refs
+        if self._cur_nid is not None:
+            self._close_note(self._cur_nid, self._cur_total)
+            self._cur_nid = None
+            self._cur_total = 0
         # live references (no copies): callers that keep only derived scalars/sets can drop
         # this dict and the pass-A bookkeeping is freed before pass B starts
         return {
@@ -1077,8 +1138,12 @@ class _ExpansionPassB:
     memory is O(#raters on seed notes), never O(#rows), and stored compactly — one pid->index
     dict plus a flat int64 array of SLOTS counters per rater (shared, helpful, not_helpful,
     match_helpful, match_not_helpful) instead of one dict per rater, so multi-million-rater
-    seed-note fan-out cannot OOM the worker. Assumes the snapshot carries one rating row per
-    (noteId, raterParticipantId) — the same assumption the burst detector makes."""
+    seed-note fan-out cannot OOM the worker. Duplicate (noteId, raterParticipantId) rows are
+    de-duplicated exactly like pass A: the shards stream noteId-sorted, so a single seen-set
+    per noteId keeps the dedupe at O(fan-in of one note) memory — and seed notes are
+    fan-in-capped by pass A, so that set stays O(note_fanin_cap), never O(#rows). Counters
+    therefore count DISTINCT seed notes per rater, so shared_seed_notes is a true distinct
+    count and same_direction_jaccard cannot exceed 1.0."""
 
     SLOTS = 5
 
@@ -1088,15 +1153,24 @@ class _ExpansionPassB:
         self.idx = {}
         self.stats = array.array("q")
         self.rows_scanned = 0
+        self._cur_nid = None
+        self._cur_seen = set()  # raters already counted on the current noteId
 
     def update(self, row: dict) -> None:
         self.rows_scanned += 1
         nid = row.get("noteId")
+        if nid != self._cur_nid:
+            # rows stream noteId-sorted: reset the per-note seen set when the note changes
+            self._cur_nid = nid
+            self._cur_seen = set()
         if not nid or nid not in self.seed_notes:
             return
         pid = _rater_pid(row)
         if not pid:
             return  # unknown-rater rows are never attributed to a participant
+        if pid in self._cur_seen:
+            return  # duplicate (noteId, rater) row: counted once (distinct-note counters)
+        self._cur_seen.add(pid)
         i = self.idx.get(pid)
         if i is None:
             i = self.idx[pid] = len(self.stats) // self.SLOTS
@@ -1143,13 +1217,17 @@ EXPANSION_SPILL_RATERS = 200_000
 class _PassBSpill:
     """Bounded pass-B accumulation around _ExpansionPassB: when the in-RAM index reaches
     `spill_raters` distinct raters, the counters are written pid-sorted to a temp TSV and the
-    RAM table is reset. finish() flushes the last partial chunk and returns (files, total)."""
+    RAM table is reset. finish() flushes the last partial chunk and returns (files, total).
+    Every temp file created is also appended to `tracked` (if given) the moment it exists,
+    so the caller can sweep even the in-flight chunk when the stream raises mid-pass."""
 
-    def __init__(self, seed_notes, note_majority: dict, spill_raters: int = None, tmpdir: str = None):
+    def __init__(self, seed_notes, note_majority: dict, spill_raters: int = None, tmpdir: str = None,
+                 tracked: list = None):
         self.seed_notes = seed_notes
         self.note_majority = note_majority
         self.spill_raters = spill_raters or EXPANSION_SPILL_RATERS
         self.tmpdir = tmpdir
+        self.tracked = tracked if tracked is not None else []
         self.pb = _ExpansionPassB(seed_notes, note_majority)
         self.files = []
         self.spilled = 0
@@ -1163,6 +1241,7 @@ class _PassBSpill:
         if not self.pb.idx:
             return
         fd, path = tempfile.mkstemp(prefix="cn_passb_", suffix=".tsv", dir=self.tmpdir)
+        self.tracked.append(path)
         stats = self.pb.stats
         with os.fdopen(fd, "w") as f:
             for pid in sorted(self.pb.idx):
@@ -1385,7 +1464,11 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
             shared = int(st.get("shared", 0))
             jac = same_direction_jaccard(st, seed_h, seed_n)
             dirs = rater_note_dir.get(pid) or {}
-            n_handles = sum(1 for n in dirs if n in note_handle)
+            # distinct target HANDLES covered, exactly like score_participant does, so the
+            # cheap selection score, tier counts, max_handles_covered and the emitted rows
+            # all agree (counting rated notes here would score 2-3 notes on one handle as
+            # 2-3 "handles")
+            n_handles = len({note_handle[n] for n in dirs if n in note_handle})
             score, tier = participant_score(
                 shared, jac, n_handles,
                 pid in (flag_sets.get("v1") or ()), pid in (flag_sets.get("lockstep") or ()),
@@ -1400,7 +1483,15 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
     pfile = expansion.get("participants_file")
     try:
         k = max(max_rows, id_cap)
-        top = heapq.nsmallest(k, _scored_entries()) if k > 0 else []
+        if k > 0:
+            top = heapq.nsmallest(k, _scored_entries())
+        else:
+            # both output caps are 0: still drain the generator so the summary counts
+            # (participants_total / per_level / tier_counts / max_handles_covered) cover
+            # the full participant set; only the row/ids materialization is capped
+            for _ in _scored_entries():
+                pass
+            top = []
         rows = [
             score_participant(pid, st, seed_h, seed_n, note_handle, rater_note_dir,
                               flag_sets, baseline, seed_notes)
@@ -1436,8 +1527,11 @@ def build_participant_expansion_vector(expansion: dict, note_handle: dict, rater
 async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict:
     """Phase-2 expansion driver: re-stream the already-resolved ratings shard URLs, pass A
     (seed rows) then pass B (rows on seed notes) per expansion level, logging each pass like
-    the V6 baseline pass. Memory-bounded (per-seed reservoir cap, note fan-in cap, counters
-    only in pass B) and deterministic (seeded rng)."""
+    the V6 baseline pass. Memory-bounded by config (pass A records at most
+    expand_seed_max x expand_rater_note_cap seed-note pairs; pass B spills pid-sorted counter
+    chunks to disk every EXPANSION_SPILL_RATERS raters) and deterministic (seeded rng).
+    Every temp file is tracked and swept when the run raises mid-pass, so an activity retry
+    cannot leak spill/level/participants files into /tmp."""
     import httpx
 
     rng = random.Random(EXPANSION_RNG_SEED)
@@ -1448,102 +1542,129 @@ async def run_participant_expansion(shard_urls: list, seed_ids: list, p) -> dict
     seed_h = seed_n = 0
     level_files = []
     discovery = {}  # pid -> first discovery level, only for re-seeded participants (bounded by expand_seed_max)
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        for level in range(1, levels + 1):
-            logger.info("cn expansion pass A level=%d: streaming %d ratings shards filtered on %d seed raters",
-                        level, len(shard_urls), len(cur_seeds))
-            pa = _ExpansionPassA(cur_seeds, p.expand_rater_note_cap, p.expand_note_fanin_cap, rng)
-            rows_a = 0
-            for url in shard_urls:
-                async for row in _aiter_tsv_rows(client, url):
-                    rows_a += 1
-                    pa.update(row)
-            res_a = pa.result()
-            seed_notes = res_a["seed_notes"]
-            note_majority = expansion_seed_note_majority(res_a["note_agg"])
-            seed_h = sum(1 for m in note_majority.values() if m == "helpful")
-            seed_n = sum(1 for m in note_majority.values() if m == "not_helpful")
-            fanin_excluded = res_a["fanin_excluded"]
-            logger.info("cn expansion pass A level=%d done: rows_scanned=%d seed_notes=%d fanin_excluded=%d",
-                        level, rows_a, len(seed_notes), fanin_excluded)
-            passes.append({"level": level, "pass": "A", "shards": len(shard_urls), "rows_scanned": rows_a,
-                           "seed_notes": len(seed_notes), "fanin_excluded": fanin_excluded})
-            res_a = None
-            pa = None
-            logger.info("cn expansion pass B level=%d: streaming %d ratings shards filtered on %d seed notes",
-                        level, len(shard_urls), len(seed_notes))
-            spiller = _PassBSpill(seed_notes, note_majority)
-            rows_b = 0
-            for url in shard_urls:
-                async for row in _aiter_tsv_rows(client, url):
-                    rows_b += 1
-                    spiller.update(row)
-            spill_files, _ = spiller.finish()
-            seed_set = set(cur_seeds)
-            fd, ppath = tempfile.mkstemp(prefix="cn_participants_", suffix=".tsv")
-            level_files.append(ppath)
-            count = 0
-            distinct = 0
-            seen_seeds = set()
-            next_seed_list = []
-            next_seen = 0
-            with os.fdopen(fd, "w") as out:
-                for pid, tot in _merge_passb_files(spill_files):
-                    distinct += 1
-                    if pid in seed_set:
-                        lvl = discovery.get(pid, 0)
-                        seen_seeds.add(pid)
-                    else:
-                        if tot[0] < p.expand_min_shared_notes:
-                            continue  # shares too few seed notes to be a participant
-                        lvl = level
-                        if level < levels:
-                            next_seen += 1
-                            if len(next_seed_list) < p.expand_seed_max:
-                                next_seed_list.append(pid)
-                            else:
-                                j = rng.randrange(next_seen)
-                                if j < p.expand_seed_max:
-                                    next_seed_list[j] = pid
-                    out.write("%s\t%d\t%d\t%d\t%d\t%d\t%d\n" % (pid, tot[0], tot[1], tot[2], tot[3], tot[4], lvl))
-                    count += 1
-                for pid in sorted(seed_set - seen_seeds):
-                    out.write("%s\t0\t0\t0\t0\t0\t0\n" % pid)
-                    count += 1
-            for fp in spill_files:
+    emitted_seeds = set()  # seed-side pids already written to a level file (bounded like discovery)
+    all_tmp = []    # every temp file this run created (incl. in-flight spill chunks); swept on failure
+    participants_file = None
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for level in range(1, levels + 1):
+                logger.info("cn expansion pass A level=%d: streaming %d ratings shards filtered on %d seed raters",
+                            level, len(shard_urls), len(cur_seeds))
+                pa = _ExpansionPassA(cur_seeds, p.expand_rater_note_cap, p.expand_note_fanin_cap, rng)
+                rows_a = 0
+                for url in shard_urls:
+                    async for row in _aiter_tsv_rows(client, url):
+                        rows_a += 1
+                        pa.update(row)
+                res_a = pa.result()
+                seed_notes = res_a["seed_notes"]
+                note_majority = expansion_seed_note_majority(res_a["note_agg"])
+                seed_h = sum(1 for m in note_majority.values() if m == "helpful")
+                seed_n = sum(1 for m in note_majority.values() if m == "not_helpful")
+                fanin_excluded = res_a["fanin_excluded"]
+                logger.info("cn expansion pass A level=%d done: rows_scanned=%d seed_notes=%d fanin_excluded=%d",
+                            level, rows_a, len(seed_notes), fanin_excluded)
+                passes.append({"level": level, "pass": "A", "shards": len(shard_urls), "rows_scanned": rows_a,
+                               "seed_notes": len(seed_notes), "fanin_excluded": fanin_excluded})
+                res_a = None
+                pa = None
+                logger.info("cn expansion pass B level=%d: streaming %d ratings shards filtered on %d seed notes",
+                            level, len(shard_urls), len(seed_notes))
+                spiller = _PassBSpill(seed_notes, note_majority, tracked=all_tmp)
+                rows_b = 0
+                for url in shard_urls:
+                    async for row in _aiter_tsv_rows(client, url):
+                        rows_b += 1
+                        spiller.update(row)
+                spill_files, _ = spiller.finish()
+                seed_set = set(cur_seeds)
+                fd, ppath = tempfile.mkstemp(prefix="cn_participants_", suffix=".tsv")
+                all_tmp.append(ppath)
+                level_files.append(ppath)
+                count = 0
+                distinct = 0
+                seen_seeds = set()
+                next_seed_list = []
+                next_seen = 0
+                with os.fdopen(fd, "w") as out:
+                    for pid, tot in _merge_passb_files(spill_files):
+                        distinct += 1
+                        if pid in seed_set:
+                            lvl = discovery.get(pid, 0)
+                            seen_seeds.add(pid)
+                        else:
+                            if tot[0] < p.expand_min_shared_notes:
+                                continue  # shares too few seed notes to be a participant
+                            lvl = level
+                            if level < levels:
+                                next_seen += 1
+                                if len(next_seed_list) < p.expand_seed_max:
+                                    next_seed_list.append(pid)
+                                else:
+                                    j = rng.randrange(next_seen)
+                                    if j < p.expand_seed_max:
+                                        next_seed_list[j] = pid
+                        out.write("%s\t%d\t%d\t%d\t%d\t%d\t%d\n" % (pid, tot[0], tot[1], tot[2], tot[3], tot[4], lvl))
+                        count += 1
+                if level == levels:
+                    # zero-placeholder rows for seeds that produced no pass-B row in ANY level:
+                    # written to a SEPARATE pid-sorted file (merged as its own stream) so every
+                    # per-level file stays pid-sorted for the heapq.merge, and only at the final
+                    # level so a later level can never overwrite real counters with zeros
+                    missing = seed_set - seen_seeds - emitted_seeds
+                    if missing:
+                        fd2, zpath = tempfile.mkstemp(prefix="cn_participants_zero_", suffix=".tsv")
+                        all_tmp.append(zpath)
+                        level_files.append(zpath)
+                        with os.fdopen(fd2, "w") as zout:
+                            for pid in sorted(missing):
+                                zout.write("%s\t0\t0\t0\t0\t0\t%d\n" % (pid, discovery.get(pid, 0)))
+                                count += 1
+                emitted_seeds |= seen_seeds
+                if next_seed_list:
+                    emitted_seeds |= set(next_seed_list)
+                logger.info("cn expansion pass B level=%d done: rows_scanned=%d raters_on_seed_notes=%d participants=%d",
+                            level, rows_b, distinct, count)
+                passes.append({"level": level, "pass": "B", "shards": len(shard_urls), "rows_scanned": rows_b,
+                               "raters_seen": distinct, "participants": count})
+                if level < levels:
+                    for pid in next_seed_list:
+                        discovery[pid] = level
+                cur_seeds = seed_set | set(next_seed_list)
+        fd, participants_file = tempfile.mkstemp(prefix="cn_participants_", suffix=".tsv")
+        all_tmp.append(participants_file)
+        participants_count = 0
+        with os.fdopen(fd, "w") as out:
+            for pid, tot, lvl in _merge_participant_files(level_files):
+                out.write("%s\t%d\t%d\t%d\t%d\t%d\t%d\n" % (pid, tot[0], tot[1], tot[2], tot[3], tot[4], lvl))
+                participants_count += 1
+        # success: every spill/level file has been merged into participants_file — unlink them
+        for fp in all_tmp:
+            if fp != participants_file:
                 try:
                     os.unlink(fp)
                 except OSError:
                     pass
-            logger.info("cn expansion pass B level=%d done: rows_scanned=%d raters_on_seed_notes=%d participants=%d",
-                        level, rows_b, distinct, count)
-            passes.append({"level": level, "pass": "B", "shards": len(shard_urls), "rows_scanned": rows_b,
-                           "raters_seen": distinct, "participants": count})
-            if level < levels:
-                for pid in next_seed_list:
-                    discovery[pid] = level
-            cur_seeds = seed_set | set(next_seed_list)
-    fd, participants_file = tempfile.mkstemp(prefix="cn_participants_", suffix=".tsv")
-    participants_count = 0
-    with os.fdopen(fd, "w") as out:
-        for pid, tot, lvl in _merge_participant_files(level_files):
-            out.write("%s\t%d\t%d\t%d\t%d\t%d\t%d\n" % (pid, tot[0], tot[1], tot[2], tot[3], tot[4], lvl))
-            participants_count += 1
-    for fp in level_files:
-        try:
-            os.unlink(fp)
-        except OSError:
-            pass
-    return {
-        "seeds": sorted(seed_ids),
-        "participants_file": participants_file,
-        "participants_count": participants_count,
-        "seed_notes": seed_notes,
-        "seed_helpful_notes": seed_h,
-        "seed_not_helpful_notes": seed_n,
-        "levels_run": levels,
-        "passes": passes,
-    }
+        return {
+            "seeds": sorted(seed_ids),
+            "participants_file": participants_file,
+            "participants_count": participants_count,
+            "seed_notes": seed_notes,
+            "seed_helpful_notes": seed_h,
+            "seed_not_helpful_notes": seed_n,
+            "levels_run": levels,
+            "passes": passes,
+        }
+    except BaseException:
+        # a flaky shard host raises mid-pass (the normal failure mode of _download_shard):
+        # sweep every temp file this run created before re-raising, so the retry cannot
+        # leak spill/level/participants files into /tmp
+        for fp in all_tmp:
+            try:
+                os.unlink(fp)
+            except OSError:
+                pass
+        raise
 
 
 # ── Activity 1: resolve target handles to their recent posts via x.md ────────
@@ -2722,7 +2843,10 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
                 expansion = await run_participant_expansion(ratings_urls, seed_ids, p)
                 vectors["participant_expansion"] = build_participant_expansion_vector(
                     expansion, note_handle, rater_note_dir,
-                    {"v1": v1_flagged_full, "lockstep": v2_flagged_full, "cohort": cohort_members, "burst": v5_shared_full},
+                    # all four flag sets are sets so the per-participant `in_*` lookups are
+                    # O(1) (v5_shared_full is a sorted list for deterministic seeding only)
+                    {"v1": v1_flagged_full, "lockstep": v2_flagged_full, "cohort": cohort_members,
+                     "burst": set(v5_shared_full)},
                     data.get("baseline_by_rater"), p,
                 )
                 expansion = None
@@ -2806,7 +2930,10 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
         while keep > 1000 and len(json.dumps(out)) > 1_800_000:
             keep = max(1000, keep // 2)
             vec7["participant_ids"] = ids[:keep]
-        vec7["participant_ids_truncated_to"] = keep
+        # mark the truncation only when ids were actually removed (not when the loop hit
+        # its floor without trimming, e.g. an oversized result dominated by other fields)
+        if len(vec7["participant_ids"]) < len(ids):
+            vec7["participant_ids_truncated_to"] = keep
     return out
 
 
@@ -2849,6 +2976,10 @@ def _augment_assessment_with_expansion(assessment: dict, exp: dict) -> dict:
     a participant_expansion entry under assessment.vectors, and the expansion methodology
     caveat (the prompt also asks the model for these; this guarantees their presence/shape).
     Pseudonymous participant IDs only — never identities."""
+    if not isinstance(assessment, dict):
+        # unparsed LLM output (parsed=None): degrade gracefully, return it unchanged instead
+        # of crashing the activity
+        return assessment
     s = exp.get("summary") or {}
     per_level = s.get("participants_per_level") or {}
     tiers = s.get("tier_counts") or {}
@@ -2962,7 +3093,9 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
     parsed = resp.choices[0].message.parsed
     out = parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
     exp_vec = (findings.get("vectors") or {}).get("participant_expansion")
-    if isinstance(exp_vec, dict):
+    # augment only when BOTH sides are dicts: parsed can be None on an unparseable response,
+    # and the run must then complete with the degraded (None) assessment as before
+    if isinstance(exp_vec, dict) and isinstance(out, dict):
         out = _augment_assessment_with_expansion(out, exp_vec)
     return out
 

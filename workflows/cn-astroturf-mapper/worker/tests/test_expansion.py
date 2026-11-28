@@ -63,7 +63,7 @@ def test_pass_a_records_seed_notes_and_directions():
     assert res["note_agg"]["n1"] == {"raters": {"s1", "s2"}, "helpful": 2, "not_helpful": 0}
     assert res["note_agg"]["n2"]["not_helpful"] == 1
     assert res["fanin_excluded"] == 0
-    assert set(res["seed_note_lists"]["s1"]) == {"n1", "n2"}
+    assert {n for n, _ in res["seed_note_lists"]["s1"]} == {"n1", "n2"}
 
 
 def test_pass_a_note_fanin_cap_excludes_mega_notes():
@@ -73,6 +73,21 @@ def test_pass_a_note_fanin_cap_excludes_mega_notes():
     assert res["fanin_excluded"] == 1
     # the excluded note's contribution is rolled back: s0 also rated n2 (kept), the rest drop to 0
     assert res["seed_shared"] == {"s0": 1, "s1": 0, "s2": 0, "s3": 0}
+
+
+def test_pass_a_mega_note_guard_uses_total_fan_in_not_seed_fan_in():
+    # the guard must fire on TOTAL rater fan-in: with a seed-capped seed set the seed fan-in can
+    # never exceed the cap at defaults, so a viral note rated by 1 seed + many organic raters
+    # must still be excluded (otherwise pass B enumerates millions of organic co-raters)
+    rows = [_row("n1", "s1", "HELPFUL")] + [_row("n1", f"o{i}", "HELPFUL") for i in range(5)]
+    rows += [_row("n2", "s1", "HELPFUL"), _row("n3", "s1", "HELPFUL"), _row("n3", "o9", "HELPFUL")]
+    res = expansion_pass_a(rows, {"s1"}, rater_note_cap=500, note_fanin_cap=3)
+    # n1: total fan-in 6 > cap 3 -> excluded even though only ONE seed rated it; n3 (fan-in 2)
+    # and n2 (fan-in 1) stay
+    assert res["seed_notes"] == {"n2", "n3"}
+    assert res["fanin_excluded"] == 1
+    assert res["seed_shared"] == {"s1": 2}  # the excluded note's vote is rolled back
+    assert "n1" not in res["note_agg"]
 
 
 def test_pass_a_per_seed_reservoir_cap_is_bounded_and_deterministic():
@@ -85,15 +100,33 @@ def test_pass_a_per_seed_reservoir_cap_is_bounded_and_deterministic():
     assert r1["seed_note_lists"] == r2["seed_note_lists"]  # seeded => reproducible
     # the shared count follows the per-seed recording cap (bounded note_agg memory)
     assert r1["seed_shared"]["s1"] == 5
+    recorded = {n for n, _ in r1["seed_note_lists"]["s1"]}
+    assert recorded <= {f"n{i}" for i in range(50)}
+    # true reservoir sample, not a stream-order prefix: a different rng seed records a
+    # different subset (a prefix would always record n0..n4)
+    other = expansion_pass_a(rows, {"s1"}, rater_note_cap=5, note_fanin_cap=100,
+                             rng=random.Random(999))
+    assert {n for n, _ in other["seed_note_lists"]["s1"]} != recorded
+    # eviction keeps note_agg consistent with the reservoir lists: a note's rater set is
+    # exactly the seeds that still hold the note in their capped list
+    for nid, agg in r1["note_agg"].items():
+        assert agg["raters"] == {q for q, lst in r1["seed_note_lists"].items()
+                                 if any(n == nid for n, _ in lst)}
+    assert len(r1["note_agg"]) == 5  # bounded by rater_note_cap, not by the 50 rows
 
 
 def test_pass_a_per_seed_cap_bounds_note_agg_memory():
-    # a seed rating far more notes than rater_note_cap must not grow note_agg without bound
+    # a seed rating far more notes than rater_note_cap must not grow note_agg without bound:
+    # at most rater_note_cap recorded pairs per seed, so <= seed_max x rater_note_cap entries
     rows = [_row(f"n{i}", "s1", "HELPFUL") for i in range(50)] + [_row("shared", "s2", "HELPFUL")]
     res = expansion_pass_a(rows, {"s1", "s2"}, rater_note_cap=5, note_fanin_cap=100)
     assert res["seed_shared"]["s1"] == 5                      # per-seed recording capped
     assert len(res["note_agg"]) == 6                           # 5 notes of s1 + the shared one
     assert res["seed_shared"]["s2"] == 1
+    # direction counters agree with the recorded (note, direction) pairs after evictions
+    total_helpful = sum(a["helpful"] for a in res["note_agg"].values())
+    total_pairs = sum(len(lst) for lst in res["seed_note_lists"].values())
+    assert total_helpful == total_pairs
     # determinism of the capped recording under the seeded reservoir
     again = expansion_pass_a(rows, {"s1", "s2"}, rater_note_cap=5, note_fanin_cap=100,
                              rng=random.Random(mod.EXPANSION_RNG_SEED))
@@ -267,7 +300,9 @@ def test_pass_b_spill_merge_is_bounded_and_exact(tmp_path):
     files, _ = sp.finish()
     assert len(files) >= 2
     merged = dict(mod._merge_passb_files(files))
-    assert merged["a"] == [3, 2, 1, 1, 1]
+    # the duplicate (n2, a) row is counted ONCE (distinct-note counters), so a's n2 vote is the
+    # first NOT_HELPFUL one: a = n1 HELPFUL + n2 NOT_HELPFUL = [2, 1, 1, 1, 1]
+    assert merged["a"] == [2, 1, 1, 1, 1]
     assert merged["b"] == [1, 1, 0, 1, 0]
     assert merged["c"] == [1, 1, 0, 1, 0]
     assert "z" not in merged  # n9 is not a seed note
@@ -501,7 +536,8 @@ def test_pass_b_compact_storage_matches_dict_view():
     assert len(pb.idx) == 2 and len(pb.stats) == 2 * pb.SLOTS
     via_result = expansion_pass_b(rows, {"n1", "n2"}, majority)
     assert dict(pb.iter_stats()) == via_result["rater_stats"]
-    assert via_result["rater_stats"]["r1"] == {"shared": 3, "helpful": 2, "not_helpful": 1,
+    # the second (n2, r1) row is a duplicate: counted once -> shared=2, not 3
+    assert via_result["rater_stats"]["r1"] == {"shared": 2, "helpful": 1, "not_helpful": 1,
                                                "match_helpful": 1, "match_not_helpful": 1}
     assert via_result["rater_stats"]["r2"] == {"shared": 1, "helpful": 0, "not_helpful": 1,
                                                "match_helpful": 0, "match_not_helpful": 0}
@@ -550,3 +586,176 @@ def test_vector_builder_scores_all_but_materializes_only_capped_rows(monkeypatch
     )
     assert vec["participant_ids"] == [pid for _, pid in keys[:13]]
     assert [r["participantId"] for r in vec["rows"]] == [pid for _, pid in keys[:7]]
+
+
+# ── Morning Star PR-#18 fixes ──
+
+
+def test_pass_b_duplicate_note_rater_rows_counted_once():
+    # fb7dbdd95ddd2: duplicate (noteId, rater) rows must not inflate shared_seed_notes or push
+    # same_direction_jaccard above 1.0
+    seed_notes = {"n1"}
+    majority = {"n1": "helpful"}
+    rows = [
+        _row("n1", "p1", "HELPFUL"),
+        _row("n1", "p1", "HELPFUL"),  # duplicate row (e.g. Range-resume replay)
+        _row("n1", "p1", "HELPFUL"),  # another duplicate
+        _row("n1", "p2", "NOT_HELPFUL"),
+    ]
+    res = expansion_pass_b(rows, seed_notes, majority)
+    st = res["rater_stats"]["p1"]
+    assert st == {"shared": 1, "helpful": 1, "not_helpful": 0,
+                  "match_helpful": 1, "match_not_helpful": 0}
+    # 2 duplicate helpful rows on the only majority-helpful seed note: jac = 1/(1+1-1) = 1.0, not 2.0
+    assert same_direction_jaccard(st, seed_helpful_notes=1, seed_not_helpful_notes=0) == 1.0
+    assert res["rater_stats"]["p2"]["shared"] == 1
+
+
+def test_vector_builder_counts_distinct_handles_not_notes():
+    # f720303c4c622: the cheap scoring pass must count distinct target HANDLES exactly like
+    # score_participant, so summary tiers, max_handles_covered, the top-row/ids selection and
+    # the emitted rows all agree
+    p = AstroturfMapperInput(target_handles=["h1", "h2"], max_vector_rows_in_result=10,
+                             expand_max_participants=10)
+    note_handle = {"n1": "h1", "n2": "h1", "n3": "h1", "m1": "h2"}
+    rater_note_dir = {
+        "s1": {"n1": "helpful", "n2": "helpful", "n3": "not_helpful"},  # 3 notes, ONE handle
+        "p1": {"m1": "helpful"},                                        # 1 note, other handle
+    }
+    expansion = {
+        "seeds": ["s1"],
+        "participants": {
+            "s1": {"level": 0, "shared": 5, "helpful": 5, "not_helpful": 0,
+                   "match_helpful": 5, "match_not_helpful": 0},
+            "p1": {"level": 1, "shared": 2, "helpful": 2, "not_helpful": 0,
+                   "match_helpful": 2, "match_not_helpful": 0},
+        },
+        "seed_notes": {"n1"}, "seed_helpful_notes": 1, "seed_not_helpful_notes": 0,
+        "levels_run": 1, "passes": [],
+    }
+    vec = build_participant_expansion_vector(expansion, note_handle, rater_note_dir, {}, None, p)
+    assert vec["summary"]["max_handles_covered"] == 1  # distinct handles, not the 3 rated notes
+    row_s1 = next(r for r in vec["rows"] if r["participantId"] == "s1")
+    assert row_s1["handles_covered"] == ["h1"] and row_s1["handles_covered_count"] == 1
+    # rows come out sorted by their own published score (cheap pass == row score now)
+    scores = [r["score"] for r in vec["rows"]]
+    assert scores == sorted(scores, reverse=True)
+    assert sum(vec["summary"]["tier_counts"].values()) == vec["summary"]["participants_total"] == 2
+
+
+def test_vector_builder_zero_caps_still_counts_full_summary():
+    # f3d31ec737cdd: with both output caps 0 the scored-entries generator must still be drained
+    # so the summary reflects the real participant set
+    p = AstroturfMapperInput(target_handles=["h1"], max_vector_rows_in_result=0,
+                             expand_max_participants=0)
+    expansion = {
+        "seeds": ["s1"],
+        "participants": {
+            "s1": {"level": 0, "shared": 9, "helpful": 9, "not_helpful": 0,
+                   "match_helpful": 9, "match_not_helpful": 0},
+            "p1": {"level": 1, "shared": 3, "helpful": 0, "not_helpful": 3,
+                   "match_helpful": 0, "match_not_helpful": 3},
+            "p2": {"level": 1, "shared": 1, "helpful": 1, "not_helpful": 0,
+                   "match_helpful": 1, "match_not_helpful": 0},
+        },
+        "seed_notes": {"n1"}, "seed_helpful_notes": 1, "seed_not_helpful_notes": 0,
+        "levels_run": 1, "passes": [],
+    }
+    vec = build_participant_expansion_vector(expansion, {}, {}, {}, None, p)
+    assert vec["rows"] == [] and vec["participant_ids"] == []
+    assert vec["summary"]["participants_total"] == 3
+    assert vec["summary"]["participants_per_level"] == {"0": 1, "1": 2}
+    assert sum(vec["summary"]["tier_counts"].values()) == 3
+
+
+def test_augment_assessment_non_dict_passthrough():
+    # feb6363b90645: unparsed LLM output (parsed=None) must pass through unchanged, not crash
+    assert _augment_assessment_with_expansion(None, {"summary": {"seeds": 1}}) is None
+    assert _augment_assessment_with_expansion("text", {"summary": {}}) == "text"
+
+
+def test_detect_hands_burst_flag_set_to_builder(monkeypatch):
+    # f30e7e24f0bbd: all four flag lookups in the builder must be O(1) set membership
+    p, targets, notes, data = _detect_fixture()
+    captured = {}
+    real_builder = mod.build_participant_expansion_vector
+
+    def spy(expansion, note_handle, rater_note_dir, flag_sets, baseline_by_rater, p):
+        captured["flag_sets"] = flag_sets
+        return real_builder(expansion, note_handle, rater_note_dir, flag_sets, baseline_by_rater, p)
+
+    monkeypatch.setattr(mod, "run_participant_expansion", lambda *a: _fake_expansion(*a))
+    monkeypatch.setattr(mod, "build_participant_expansion_vector", spy)
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    fs = captured["flag_sets"]
+    assert all(isinstance(fs[k], set) for k in ("v1", "lockstep", "cohort", "burst"))
+    # no truncation marker when the payload fits without trimming anything
+    assert "participant_ids_truncated_to" not in f["vectors"]["participant_expansion"]
+
+
+def test_detect_no_truncation_marker_when_nothing_was_trimmed(monkeypatch):
+    # fb991353139be: oversized result dominated by OTHER fields, ids below the trim floor ->
+    # the result is still returned, but participant_ids_truncated_to must NOT be emitted
+    import json
+    p, targets, notes, data = _detect_fixture()
+    p.expand_max_participants = 800  # below the 1000 trim floor
+    notes = notes + [
+        {"noteId": f"x{i}", "tweetId": f"tx{i}", "author_participant_id": "au",
+         "createdAtMillis": 3 + i, "classification": "MISINFORMED_OR_POTENTIALLY_MISLEADING",
+         "summary_excerpt": "x" * 1000}
+        for i in range(2500)
+    ]
+    monkeypatch.setattr(mod, "run_participant_expansion", lambda *a: _fake_expansion(*a))
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    v7 = f["vectors"]["participant_expansion"]
+    assert len(json.dumps(f)) > 1_800_000            # oversized result still returned
+    assert len(v7["participant_ids"]) == 7            # 6 seeds + newbie; nothing was trimmed
+    assert "participant_ids_truncated_to" not in v7
+
+
+def test_run_participant_expansion_sweeps_temp_files_on_failure(monkeypatch, tmp_path):
+    # f734c9465dcd5: a shard download/stream raising mid-pass must not leak spill/level/
+    # participants temp files into the temp dir (the activity retries after such failures)
+    calls = {"n": 0}
+
+    async def fake_rows(client, url):
+        calls["n"] += 1
+        if calls["n"] >= 4:  # pass B, second shard
+            raise RuntimeError("shard host flaky")
+        yield _row("n1", "s1", "HELPFUL")
+        yield _row("n1", "p1", "HELPFUL")
+
+    monkeypatch.setattr(mod, "_aiter_tsv_rows", fake_rows)
+    monkeypatch.setattr(mod, "EXPANSION_SPILL_RATERS", 1)  # force a spill file before the failure
+    monkeypatch.setattr(mod.tempfile, "tempdir", str(tmp_path))
+    p = AstroturfMapperInput(target_handles=["h"], expand_levels=1, expand_seed_max=10)
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_participant_expansion(["fake://0", "fake://1"], ["s1"], p))
+    assert calls["n"] == 4
+    assert list(tmp_path.iterdir()) == []  # every temp file (incl. in-flight spill) was swept
+
+
+def test_run_participant_expansion_level_files_stay_pid_sorted(monkeypatch):
+    # fd1c61df1dd34: zero-placeholder rows go to a separate pid-sorted stream written only at
+    # the final level, so the multi-level heapq.merge never sees unsorted input and never
+    # emits one participant twice
+    async def fake_rows(client, url):
+        yield _row("n1", "s1", "HELPFUL")  # seed a0 rates nothing -> placeholder at final level
+
+    monkeypatch.setattr(mod, "_aiter_tsv_rows", fake_rows)
+    p = AstroturfMapperInput(target_handles=["h"], expand_levels=2, expand_min_shared_notes=2)
+
+    async def run():
+        return await run_participant_expansion(["fake://0"], ["s1", "a0"], p)
+
+    exp = asyncio.run(run())
+    assert exp["levels_run"] == 2 and len(exp["passes"]) == 4
+    assert exp["participants_count"] == 2  # s1 (real row) + a0 (zero placeholder), each once
+    with open(exp["participants_file"]) as f:
+        pids = [line.split("\t")[0] for line in f]
+    assert pids == sorted(set(pids))  # globally pid-sorted, no duplicates
+    parts = dict(mod.iter_expansion_participants(exp))
+    assert set(parts) == {"s1", "a0"}
+    assert parts["a0"]["shared"] == 0 and parts["a0"]["level"] == 0  # placeholder, level 0
+    assert parts["s1"]["shared"] == 1 and parts["s1"]["level"] == 0
+    os.unlink(exp["participants_file"])
